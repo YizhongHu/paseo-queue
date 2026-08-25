@@ -54,10 +54,17 @@ setup() {
     : > "$MOCK_DIR/agents.tsv"
     : > "$MOCK_DIR/calls.log"
 
-    # Baseline snapshot of the REAL $HOME/.paseo-queue -- teardown() asserts
-    # this gains no entries, since this harness must never touch it even
-    # though PASEO_QUEUE_HOME is overridden for every paseo-queue call here.
-    PQT_REAL_HOME_BEFORE="$(find "$HOME/.paseo-queue" 2>/dev/null | wc -l | tr -d ' ')"
+    # Snapshot the REAL $HOME/.paseo-queue agent directories. teardown()
+    # checks that no synthetic test-agent directory leaked there. Comparing
+    # total entry counts is intentionally avoided: unrelated live dispatchers
+    # may add or remove their own queue files while this suite runs.
+    PQT_REAL_HOME_BEFORE="$SANDBOX/real-home-before.txt"
+    : > "$PQT_REAL_HOME_BEFORE"
+    for pqt_real_agent in "$HOME"/.paseo-queue/*; do
+        [ -d "$pqt_real_agent" ] || continue
+        printf '%s\n' "$pqt_real_agent" >> "$PQT_REAL_HOME_BEFORE"
+    done
+    LC_ALL=C sort -o "$PQT_REAL_HOME_BEFORE" "$PQT_REAL_HOME_BEFORE"
 }
 
 teardown() {
@@ -83,11 +90,22 @@ teardown() {
         done
     fi
 
-    pqt_real_home_after="$(find "$HOME/.paseo-queue" 2>/dev/null | wc -l | tr -d ' ')"
-    if [ "$pqt_real_home_after" != "$PQT_REAL_HOME_BEFORE" ]; then
+    pqt_real_leak=""
+    if [ -n "$SANDBOX" ] && [ -d "$SANDBOX/home" ]; then
+        for pqt_local_agent in "$SANDBOX"/home/*; do
+            [ -d "$pqt_local_agent" ] || continue
+            pqt_agent_name="$(basename "$pqt_local_agent")"
+            pqt_real_agent="$HOME/.paseo-queue/$pqt_agent_name"
+            if [ -d "$pqt_real_agent" ] && ! grep -Fqx -- "$pqt_real_agent" "$PQT_REAL_HOME_BEFORE"; then
+                pqt_real_leak="$pqt_real_agent"
+                break
+            fi
+        done
+    fi
+    if [ -n "$pqt_real_leak" ]; then
         # Preserve the sandbox for forensics instead of deleting it -- this
         # should never happen if the harness is working correctly.
-        echo "FAIL: real \$HOME/.paseo-queue gained entries during test (before=$PQT_REAL_HOME_BEFORE after=$pqt_real_home_after)" >&2
+        echo "FAIL: test agent state leaked into real \$HOME/.paseo-queue: $pqt_real_leak" >&2
         echo "  sandbox preserved for inspection: $SANDBOX" >&2
         exit 1
     fi

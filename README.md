@@ -1,8 +1,8 @@
 # paseo-queue
 
-`paseo-queue` is a safe, ordered, fire-and-forget FIFO prompt queue for busy
-Paseo-managed agents: it lets any caller `add` a follow-up message for an
-agent that might be mid-turn, and a per-agent background dispatcher
+`paseo-queue` is an ordered, fire-and-forget FIFO prompt queue for routine
+and non-emergency coordination with Paseo-managed agents. It lets any caller
+`add` a follow-up message, and a per-agent background dispatcher
 auto-delivers each queued message, strictly in order, the moment that agent
 goes idle with no pending permission request. Each agent gets its own queue
 and dispatcher, so follow-ups to different agents are delivered in parallel
@@ -10,14 +10,26 @@ while follow-ups to the *same* agent are always delivered one at a time, in
 enqueue order.
 
 This exists because Paseo has no built-in "deliver at the agent's next
-convenience" primitive: `paseo send` delivers immediately (undefined
-behavior mid-turn), and `paseo wait` is a broadcast release shared by every
-waiter, not a queue.
+convenience" primitive. `paseo send` deliberately delivers immediately and
+is appropriate when a message is important enough to interrupt current work;
+routine prompts use this queue to preserve FIFO order and permission holds.
+`paseo wait` is a broadcast release shared by every waiter, not a queue.
+
+## Prerequisites
+
+- macOS or another POSIX `sh` environment.
+- A working, configured [`paseo`](https://github.com/getpaseo/paseo) CLI and
+  daemon.
+- `python3`, used for small JSON parsing operations.
+- `~/.local/bin` on `PATH`.
 
 ## Install
 
 ```sh
+git clone https://github.com/YizhongHu/paseo-queue.git
+cd paseo-queue
 ./install.sh
+paseo-queue --help
 ```
 
 `install.sh` is idempotent (safe to re-run) and touches exactly four
@@ -31,6 +43,39 @@ locations:
 
 It then verifies the install by running `command -v paseo-queue` and
 `paseo-queue --help`, and prints `SUCCESS`/`FAILED` accordingly.
+
+## Quick start
+
+Queue a routine follow-up without interrupting the recipient:
+
+```sh
+paseo-queue add <agent> "routine follow-up"
+```
+
+Messages can also come from a file. Add `--wait` only when your next step
+depends on the message having been dispatched:
+
+```sh
+paseo-queue add <agent> --file handoff.md
+paseo-queue add <agent> "deliver before my next step" --wait
+```
+
+Use `paseo send <agent> "message"` when a message is important enough to
+interrupt the agent's current work. The queue is the default for routine and
+non-emergency coordination.
+
+## Skill backups
+
+The repository retains durable copies of the coordination skills so a Paseo
+managed refresh cannot erase the local policy:
+
+- `skills/paseo/SKILL.md`
+- `skills/paseo-message-agent/SKILL.md`
+- `skills/paseo-queue/SKILL.md`
+
+`skill/SKILL.md` remains the installer-compatible copy of
+`skills/paseo-queue/SKILL.md`. Running `./install.sh` restores that queue skill;
+the other two snapshots can be copied back to any affected skill root.
 
 ## Usage
 
@@ -190,11 +235,10 @@ flags the two conditions below with a stderr `WARN` line.
   embed the epoch second, and delivery pops the lexicographically-first
   filename, so a clock that jumps backwards between two enqueues can make
   the later message sort before the earlier one.
-- **Never send directly to a queued agent.** Calling plain `paseo send` on
-  an agent that has messages sitting in `pending/` jumps the queue —
-  it bypasses `paseo-queue` entirely and can deliver out of order relative
-  to what's already queued. Always use `paseo-queue add` once an agent has
-  any queued state.
+- **Direct send bypasses queued ordering.** Calling plain `paseo send` on
+  an agent with messages in `pending/` intentionally takes priority and can
+  deliver out of order relative to the queue. Use it when interruption is
+  warranted; use `paseo-queue add` for non-emergency coordination.
 
 ## Disposability
 
