@@ -118,12 +118,14 @@ usage() {
 Usage: paseo-queue <subcommand> [args]
 
 Subcommands:
-  add <agent> [--file <path>] [--wait] [--wait-timeout <seconds>] [--] [text...]
+  add <agent> [text|--file <path>|stdin] [--wait] [--wait-timeout <seconds>]
       Enqueue a message for delivery to <agent>. Message content comes from
-      exactly one source: trailing positional words, --file <path>, or
-      piped stdin (mutually exclusive; with none given and stdin is a tty,
-      this is an error). Flags must precede the message text; use -- to
-      force literal text that starts with a dash.
+      exactly one source: a single [text] argument, --file <path>, or piped
+      stdin (mutually exclusive; with none given and stdin is a tty, this
+      is an error). Flags and [text] may appear in any order/interspersed;
+      a second stray positional argument is an error (quote a multi-word
+      message into one argument). Use -- to force literal [text] that
+      starts with a dash.
       Default: returns 0 immediately after the message is enqueued and the
       dispatcher is (re)spawned (fire-and-forget).
       --wait: block until the message leaves pending/: exit 0 once it is
@@ -582,7 +584,7 @@ pq_wait_for_delivery() {
 # =====================================================================
 
 cmd_add() {
-    [ "$#" -ge 1 ] || die 1 "add: usage: paseo-queue add <agent> [--file f] [--wait] [--wait-timeout s] [--] [text...]"
+    [ "$#" -ge 1 ] || die 1 "add: usage: paseo-queue add <agent> [text|--file f|stdin] [--wait] [--wait-timeout <s>]"
     ca_agent_query="$1"; shift
 
     ca_text=""
@@ -592,45 +594,74 @@ cmd_add() {
     ca_wait=0
     ca_wait_timeout=""
     ca_use_stdin=0
+    ca_saw_dashdash=0
 
-    while [ "$#" -gt 0 ]; do
-        case "$1" in
+    # Flags (--file/--wait/--wait-timeout/--) and the single positional
+    # message-text argument may appear in ANY order or interspersed --
+    # nothing about the spec's usage synopsis `add <agent> [text|--file
+    # f|stdin] [--wait] [--wait-timeout <s>]` requires flags to precede the
+    # text. This scans exactly the original argument count once: recognized
+    # flags (and their values) are consumed and dropped; every other token
+    # is re-appended to the end of "$@" via `set --` so it survives the
+    # scan as a kept positional candidate, in original relative order.
+    # Processing exactly ca_orig_count original items (not `$#`, which
+    # grows as survivors are re-appended) guarantees re-appended survivors
+    # are never rescanned as if they were new input.
+    ca_orig_count="$#"
+    ca_i=0
+    while [ "$ca_i" -lt "$ca_orig_count" ]; do
+        ca_i=$((ca_i + 1))
+        ca_cur="$1"
+        shift
+
+        if [ "$ca_saw_dashdash" -eq 1 ]; then
+            # Everything after -- is literal positional text, verbatim,
+            # even if it looks like a flag.
+            set -- "$@" "$ca_cur"
+            continue
+        fi
+
+        case "$ca_cur" in
             --file)
-                shift
-                [ "$#" -gt 0 ] || die 1 "add: --file requires a path argument"
-                ca_file="$1"
+                [ "$ca_i" -lt "$ca_orig_count" ] || die 1 "add: --file requires a path argument"
+                ca_i=$((ca_i + 1))
+                ca_file="$1"; shift
                 ca_have_file=1
-                shift
                 ;;
             --wait)
                 ca_wait=1
-                shift
                 ;;
             --wait-timeout)
-                shift
-                [ "$#" -gt 0 ] || die 1 "add: --wait-timeout requires a value in seconds"
-                ca_wait_timeout="$1"
+                [ "$ca_i" -lt "$ca_orig_count" ] || die 1 "add: --wait-timeout requires a value in seconds"
+                ca_i=$((ca_i + 1))
+                ca_wait_timeout="$1"; shift
                 case "$ca_wait_timeout" in
                     ''|*[!0-9]*) die 1 "add: --wait-timeout requires a nonnegative integer" ;;
                 esac
                 ca_wait=1
-                shift
                 ;;
             --)
-                shift
-                break
+                ca_saw_dashdash=1
                 ;;
             -*)
-                die 1 "add: unknown option: $1"
+                die 1 "add: unknown option: $ca_cur"
                 ;;
             *)
-                break
+                set -- "$@" "$ca_cur"
                 ;;
         esac
     done
 
-    if [ "$#" -gt 0 ]; then
-        ca_text="$*"
+    # At most one positional token may survive: the spec's usage synopsis
+    # takes a single (already shell-quoted, if multi-word) [text] argument,
+    # not several words to be joined -- a second stray positional argument
+    # is far more likely a forgotten-quote mistake than intentional input,
+    # so it is a hard error rather than silently glued on.
+    if [ "$#" -gt 1 ]; then
+        die 1 "add: too many positional arguments (expected at most one message-text argument); quote the message or use --file/stdin"
+    fi
+    if [ "$#" -eq 1 ]; then
+        ca_text="$1"
         ca_have_text=1
     fi
 
