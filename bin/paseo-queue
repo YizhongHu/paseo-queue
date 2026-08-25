@@ -3,8 +3,8 @@
 #
 # Disposable stopgap until getpaseo/paseo#3797 (daemon-owned queue feature)
 # ships upstream. See README.md for design details and AGENTS.md for
-# contributor rules (POSIX sh only; no jq/flock/setsid; target macOS
-# /bin/sh = bash 3.2 in sh mode).
+# contributor rules (POSIX sh only; no jq/flock/setsid/local/arrays; target
+# macOS /bin/sh = bash 3.2 in sh mode).
 set -u
 
 # --- Environment knobs (all test-overridable) --------------------------
@@ -15,10 +15,94 @@ set -u
 : "${PQ_SEND_RETRIES:=5}"
 : "${PQ_DAEMON_RETRIES:=15}"
 : "${PQ_HOLD_LOG_EVERY:=300}"
+: "${PQ_NO_SPAWN:=0}"
 
 LC_ALL=C
 export LC_ALL
 umask 077
+
+# --- Process-wide caches ---------------------------------------------------
+# `paseo ls --json` is fetched at most once per invocation and cached here.
+PQC_LS_JSON_FETCHED=0
+PQC_LS_JSON_OUT=""
+PQC_LS_JSON_RC=0
+
+# Populated by pq_split_uuid_name().
+PQC_SPLIT_UUID=""
+PQC_SPLIT_NAME=""
+
+# --- Python script bodies (JSON bridging only) -----------------------------
+# Stored as variables and invoked as `python3 -c "$VAR" args...` rather than
+# `python3 - args <<'PY' ... PY`: a heredoc attached directly to a python3
+# invocation redirects ITS OWN stdin to the heredoc body, which silently
+# discards any `paseo ls/inspect --json` output piped in from the caller.
+# Capturing the script text via `$(cat <<'PY' ... PY)` up front keeps -c's
+# stdin free for that pipe.
+PQ_PY_MATCH_AGENT="$(cat <<'PY'
+import json, sys
+
+query = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    data = []
+if isinstance(data, dict):
+    data = data.get("agents", [])
+if not isinstance(data, list):
+    data = []
+
+matched = {}
+for a in data:
+    aid = a.get("id", "")
+    name = a.get("name", "")
+    if query and aid.startswith(query):
+        matched[aid] = a
+    elif name == query:
+        matched[aid] = a
+
+if len(matched) == 1:
+    a = next(iter(matched.values()))
+    print("MATCH\t%s\t%s" % (a.get("id", ""), a.get("name", "")))
+elif len(matched) == 0:
+    print("NONE")
+else:
+    parts = ["%s (%s)" % (a.get("id", ""), a.get("name", "")) for a in matched.values()]
+    print("AMBIGUOUS\t" + "\t".join(parts))
+PY
+)"
+
+PQ_PY_AGENT_KNOWN="$(cat <<'PY'
+import json, sys
+uuid = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    data = []
+if isinstance(data, dict):
+    data = data.get("agents", [])
+if not isinstance(data, list):
+    data = []
+sys.exit(0 if any(a.get("id", "") == uuid for a in data) else 1)
+PY
+)"
+
+PQ_PY_INSPECT_AGENT="$(cat <<'PY'
+import json, sys
+try:
+    a = json.load(sys.stdin)
+except Exception:
+    print("unknown 0 0")
+    sys.exit(1)
+if isinstance(a, list):
+    a = a[0] if a else {}
+status = a.get("Status", a.get("status", "unknown"))
+archived = a.get("Archived", a.get("archived", False))
+perms = a.get("PendingPermissions", a.get("pendingPermissions", []))
+if not isinstance(perms, list):
+    perms = []
+print("%s %s %d" % (str(status).lower(), 1 if archived else 0, len(perms)))
+PY
+)"
 
 # --- Usage ---------------------------------------------------------------
 usage() {
@@ -26,15 +110,754 @@ usage() {
 Usage: paseo-queue <subcommand> [args]
 
 Subcommands:
-  add <agent> [text|--file f|stdin]   Enqueue a message for delivery to <agent>
-  ls                                   List queued agents and pending message counts
-  rm <agent> <msg|--all>               Remove a pending message (or all) for <agent>
-  status                               Show dispatcher/queue health across agents
-  drain <agent>                        Force-start the dispatcher for <agent>
-  stop <agent>                         Stop the dispatcher for <agent>
-  log <agent> [-n N] [-f]              Show (or follow) the dispatch log for <agent>
-  help                                 Show this help message
+  add <agent> [--file <path>] [--wait] [--wait-timeout <seconds>] [--] [text...]
+      Enqueue a message for delivery to <agent>. Message content comes from
+      exactly one source: trailing positional words, --file <path>, or
+      piped stdin (mutually exclusive; with none given and stdin is a tty,
+      this is an error). Flags must precede the message text; use -- to
+      force literal text that starts with a dash.
+      Default: returns 0 immediately after the message is enqueued and the
+      dispatcher is (re)spawned (fire-and-forget).
+      --wait: block until the message leaves pending/: exit 0 once it is
+      in sent/; exit 1 once it is in failed/ or the dispatcher state becomes
+      halted-closed, halted-failed, or stalled-daemon (message stays
+      queued); exit 4 if --wait-timeout elapses first (message stays
+      queued). --wait-timeout implies --wait.
+
+  ls
+      List every known agent's queue: pending/sent/failed counts and the
+      pending message filenames.
+
+  rm <agent> <msg|--all>
+      Delete one pending message (by filename) or all pending messages for
+      <agent>. After --all, if the agent's state directory is then fully
+      empty (no pending/sent/failed/tmp files, no lock) and the agent is
+      orphaned (absent from `paseo ls`), the directory itself is removed.
+
+  status
+      Show, per agent: state (from the dispatcher-owned state file),
+      pending/sent/failed counts, and dispatcher pid + liveness. Agents
+      absent from the current `paseo ls` snapshot are marked ORPHANED.
+      Emits stderr WARN lines when an agent has pending messages but no
+      live dispatcher, or when its state is holding-permission. Exits 3 if
+      `paseo ls --json` itself fails (daemon unreachable).
+
+  drain <agent>
+      Force-(re)start the dispatcher for <agent> (ensures its state
+      directories exist, then spawns the dispatcher; safe to call whether
+      or not one is already running).
+
+  stop <agent>
+      Send SIGTERM to the live dispatcher for <agent>. The queue itself
+      (pending/sent/failed) is left untouched.
+
+  log <agent> [-n N] [-f]
+      Show the last N lines (default 20) of the dispatch log for <agent>,
+      or follow it live with -f.
+
+  help | --help | -h
+      Show this help message.
+
+Agent resolution (add/ls/rm/status/log/stop/drain): a query resolves via a
+single `paseo ls --json` snapshot, by unique agent-id prefix (this subsumes
+the 7-char shortId and the full 36-char UUID) or by an EXACT agent name
+(never a name prefix, since names may contain spaces). An ambiguous query
+exits 2, listing every candidate on stderr. rm/ls/log/stop/status also
+accept a full 36-char UUID that matches an existing $PQ_HOME state
+directory even when the agent no longer appears in `paseo ls` (the "orphan"
+escape hatch) -- this never applies to add/drain, which require a live
+agent.
+
+Environment knobs (all test-overridable):
+  PQ_HOME              State root (default: $HOME/.paseo-queue)
+  PQ_LINGER            Dispatcher idle linger, seconds (default: 10)
+  PQ_WAIT_TIMEOUT      Dispatcher `paseo wait` timeout, seconds (default: 60)
+  PQ_MAX_BYTES         Max enqueued message size in bytes (default: 262144)
+  PQ_SEND_RETRIES      Transient send-failure retry count (default: 5)
+  PQ_DAEMON_RETRIES    Transient daemon-unreachable retry count (default: 15)
+  PQ_HOLD_LOG_EVERY    Rate limit for HOLD-PERM log lines, seconds (default: 300)
+  PQ_NO_SPAWN          Set to 1 to disable dispatcher auto-spawn (tests only)
+
+Exit codes:
+  0  ok
+  1  error (validation failure, missing dispatcher, no message, etc.)
+  2  agent resolution failure (not found or ambiguous)
+  3  daemon unreachable (`paseo ls`/`paseo inspect` failed)
+  4  add --wait-timeout elapsed (message remains queued)
 EOF
+}
+
+# =====================================================================
+# Small portable primitives
+# =====================================================================
+
+die() {
+    # die <exit_code> <message...>
+    die_code="$1"; shift
+    echo "paseo-queue: $*" >&2
+    exit "$die_code"
+}
+
+pq_file_size() {
+    # pq_file_size <path> -- prints byte size to stdout.
+    stat -f %z "$1" 2>/dev/null || stat -c %s "$1" 2>/dev/null || wc -c < "$1" 2>/dev/null
+}
+
+pq_dir_mtime() {
+    # pq_dir_mtime <path> -- prints mtime as epoch seconds to stdout.
+    stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null
+}
+
+pq_is_full_uuid() {
+    # pq_is_full_uuid <string> -- true iff <string> has the 8-4-4-4-12
+    # hyphenated shape of a full UUID (36 chars total; the glob's fixed
+    # arity of '?' already enforces the exact length).
+    case "$1" in
+        ????????-????-????-????-????????????) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+pq_split_uuid_name() {
+    # pq_split_uuid_name <"<uuid><TAB><name>"> -- sets PQC_SPLIT_UUID /
+    # PQC_SPLIT_NAME from a resolve_agent()-style result line.
+    PQC_SPLIT_UUID="$(printf '%s' "$1" | cut -f1)"
+    PQC_SPLIT_NAME="$(printf '%s' "$1" | cut -f2-)"
+}
+
+pq_count_msgs() {
+    # pq_count_msgs <dir> -- prints the count of *.msg files directly under
+    # <dir> (not recursive) to stdout; 0 if <dir> doesn't exist.
+    cm_dir="$1"
+    cm_n=0
+    if [ -d "$cm_dir" ]; then
+        for cm_f in "$cm_dir"/*.msg; do
+            [ -e "$cm_f" ] || continue
+            cm_n=$((cm_n + 1))
+        done
+    fi
+    printf '%s\n' "$cm_n"
+}
+
+pq_dir_is_empty() {
+    # pq_dir_is_empty <agent_dir> -- true iff pending/sent/failed/tmp hold
+    # no files and no lock/ is present.
+    dee_dir="$1"
+    for dee_sub in pending sent failed tmp; do
+        if [ -d "$dee_dir/$dee_sub" ]; then
+            for dee_f in "$dee_dir/$dee_sub"/* "$dee_dir/$dee_sub"/.[!.]*; do
+                [ -e "$dee_f" ] && return 1
+            done
+        fi
+    done
+    [ -e "$dee_dir/lock" ] && return 1
+    return 0
+}
+
+# =====================================================================
+# Fixed-name helpers (also used by the future `_dispatch` implementation)
+# =====================================================================
+
+log_line() {
+    # log_line <dir> <event> [detail...]
+    # Appends one line to <dir>/dispatch.log:
+    #   <TZ=America/New_York ISO8601 timestamp> [<pid>] <EVENT> <detail...>
+    # then opportunistically rotates the log if it has grown too large.
+    ll_dir="$1"; shift
+    ll_event="$1"; shift
+    ll_ts="$(TZ=America/New_York date '+%Y-%m-%dT%H:%M:%S%z')"
+    printf '%s [%s] %s %s\n' "$ll_ts" "$$" "$ll_event" "$*" >> "$ll_dir/dispatch.log"
+    rotate_log_if_big "$ll_dir"
+}
+
+set_state() {
+    # set_state <dir> <state> -- atomically (write-to-tmp then mv) installs
+    # the one-word dispatcher state file at <dir>/state.
+    ss_dir="$1"; ss_state="$2"
+    mkdir -p "$ss_dir/tmp" 2>/dev/null
+    ss_tmp="$ss_dir/tmp/state.$$"
+    printf '%s\n' "$ss_state" > "$ss_tmp" || die 1 "set_state: failed to write state for $ss_dir"
+    mv -f "$ss_tmp" "$ss_dir/state" || die 1 "set_state: failed to install state for $ss_dir"
+}
+
+ensure_dirs() {
+    # ensure_dirs <dir> -- creates pending/sent/failed/tmp/ under <dir> and
+    # opportunistically deletes tmp/ leftovers older than 1 day.
+    ed_dir="$1"
+    mkdir -p "$ed_dir/pending" "$ed_dir/sent" "$ed_dir/failed" "$ed_dir/tmp" \
+        || die 1 "ensure_dirs: failed to create state directories under $ed_dir"
+    find "$ed_dir/tmp" -type f -mtime +1 -exec rm -f {} + 2>/dev/null
+    return 0
+}
+
+pq_fetch_ls_json() {
+    # pq_fetch_ls_json -- fetches and caches `paseo ls --json` for this
+    # process. Returns the cached rc; safe to call repeatedly.
+    if [ "$PQC_LS_JSON_FETCHED" -eq 0 ]; then
+        PQC_LS_JSON_OUT="$(paseo ls --json 2>/dev/null)"
+        PQC_LS_JSON_RC=$?
+        PQC_LS_JSON_FETCHED=1
+    fi
+    return "$PQC_LS_JSON_RC"
+}
+
+pq_match_agent() {
+    # pq_match_agent <query> -- reads a `paseo ls --json` array from stdin;
+    # prints exactly one of:
+    #   MATCH<TAB><uuid><TAB><name>
+    #   AMBIGUOUS<TAB><uuid1> (<name1>)<TAB><uuid2> (<name2>)...
+    #   NONE
+    # Matching is: unique id-prefix (subsumes shortId/full UUID) union
+    # exact name match (never a name prefix).
+    python3 -c "$PQ_PY_MATCH_AGENT" "$1"
+}
+
+pq_agent_known() {
+    # pq_agent_known <uuid> -- true iff <uuid> appears in the cached
+    # `paseo ls --json` snapshot. If the daemon is unreachable, returns
+    # true (treat as "known") to avoid false-positive orphan cleanup.
+    ak_uuid="$1"
+    pq_fetch_ls_json || return 0
+    printf '%s' "$PQC_LS_JSON_OUT" | python3 -c "$PQ_PY_AGENT_KNOWN" "$ak_uuid"
+}
+
+resolve_agent() {
+    # resolve_agent <query> <allow_orphan:0|1>
+    # Prints "<uuid>\t<name>" on stdout on success (exit 0). On resolution
+    # failure, prints a diagnostic to stderr and exits 2 (ambiguous or not
+    # found) -- unless allow_orphan=1 and <query> is a full 36-char UUID
+    # matching an existing $PQ_HOME/<uuid> directory, which then resolves
+    # even though it is absent from `paseo ls` (never used for add/drain).
+    # Exits 3 if `paseo ls --json` itself fails.
+    ra_query="$1"
+    ra_allow_orphan="${2:-0}"
+
+    if ! pq_fetch_ls_json; then
+        die 3 "paseo ls --json failed (daemon unreachable?)"
+    fi
+
+    ra_result="$(printf '%s' "$PQC_LS_JSON_OUT" | pq_match_agent "$ra_query")"
+    ra_tag="$(printf '%s\n' "$ra_result" | cut -f1)"
+
+    case "$ra_tag" in
+        MATCH)
+            ra_uuid="$(printf '%s\n' "$ra_result" | cut -f2)"
+            ra_name="$(printf '%s\n' "$ra_result" | cut -f3)"
+            printf '%s\t%s\n' "$ra_uuid" "$ra_name"
+            return 0
+            ;;
+        AMBIGUOUS)
+            ra_cands="$(printf '%s\n' "$ra_result" | cut -f2-)"
+            {
+                printf 'paseo-queue: ambiguous agent "%s", candidates:\n' "$ra_query"
+                printf '%s\n' "$ra_cands" | tr '\t' '\n' | sed 's/^/  /'
+            } >&2
+            exit 2
+            ;;
+        *)
+            if [ "$ra_allow_orphan" = "1" ] && pq_is_full_uuid "$ra_query" && [ -d "$PQ_HOME/$ra_query" ]; then
+                ra_oname=""
+                [ -f "$PQ_HOME/$ra_query/agent.name" ] && ra_oname="$(cut -d' ' -f2- "$PQ_HOME/$ra_query/agent.name" 2>/dev/null)"
+                printf '%s\t%s\n' "$ra_query" "$ra_oname"
+                return 0
+            fi
+            die 2 "no agent matches \"$ra_query\""
+            ;;
+    esac
+}
+
+inspect_agent() {
+    # inspect_agent <uuid> -- runs `paseo inspect <uuid> --json` and prints
+    # "<status> <archived:0|1> <nperms>" to stdout (status lower-cased).
+    # Returns nonzero if the inspect call itself fails or yields no output.
+    ia_uuid="$1"
+    ia_json="$(paseo inspect "$ia_uuid" --json 2>/dev/null)"
+    ia_rc=$?
+    if [ "$ia_rc" -ne 0 ] || [ -z "$ia_json" ]; then
+        return 1
+    fi
+    printf '%s' "$ia_json" | python3 -c "$PQ_PY_INSPECT_AGENT"
+}
+
+next_msg_name() {
+    # next_msg_name <dir> -- prints a fresh "<epoch10>-<pid7>-<seq4>.msg"
+    # filename, guarding against a collision with any existing file of the
+    # same name in <dir>/pending, <dir>/sent, or <dir>/failed by
+    # incrementing the sequence number.
+    nm_dir="$1"
+    nm_epoch10="$(printf '%010d' "$(date +%s)")"
+    nm_pid7="$(printf '%07d' "$$")"
+    nm_seq=0
+    while :; do
+        nm_seq4="$(printf '%04d' "$nm_seq")"
+        nm_name="${nm_epoch10}-${nm_pid7}-${nm_seq4}.msg"
+        if [ ! -e "$nm_dir/pending/$nm_name" ] && [ ! -e "$nm_dir/sent/$nm_name" ] && [ ! -e "$nm_dir/failed/$nm_name" ]; then
+            printf '%s\n' "$nm_name"
+            return 0
+        fi
+        nm_seq=$((nm_seq + 1))
+        if [ "$nm_seq" -ge 10000 ]; then
+            die 1 "next_msg_name: unable to allocate a unique message filename in $nm_dir"
+        fi
+    done
+}
+
+lock_holder_alive() {
+    # lock_holder_alive <dir> -- true iff <dir>/lock/ is currently held by
+    # a live paseo-queue process: with a pid file, kill -0 succeeds AND
+    # `ps -p <pid> -o command=` mentions paseo-queue; without a pid file
+    # (a narrow race just after mkdir, before the pid file is written),
+    # treat as live only if lock/'s mtime is under 5 seconds old.
+    lha_dir="$1"
+    lha_lockdir="$lha_dir/lock"
+    [ -d "$lha_lockdir" ] || return 1
+
+    if [ -f "$lha_lockdir/pid" ]; then
+        lha_pid="$(cat "$lha_lockdir/pid" 2>/dev/null)"
+        case "$lha_pid" in
+            ''|*[!0-9]*) return 1 ;;
+        esac
+        if kill -0 "$lha_pid" 2>/dev/null; then
+            if ps -p "$lha_pid" -o command= 2>/dev/null | grep -q 'paseo-queue'; then
+                return 0
+            fi
+        fi
+        return 1
+    fi
+
+    lha_now="$(date +%s)"
+    lha_mtime="$(pq_dir_mtime "$lha_lockdir")"
+    if [ -n "$lha_mtime" ] && [ $(( lha_now - lha_mtime )) -lt 5 ]; then
+        return 0
+    fi
+    return 1
+}
+
+break_stale_lock() {
+    # break_stale_lock <dir> -- atomically steals a stale lock/ via
+    # `mv lock/ lock.stale.$$` (only one racing process can win the mv),
+    # then removes the stolen copy. If the mv fails, another process is
+    # already stealing (or racing to acquire); the caller simply retries.
+    bsl_dir="$1"
+    bsl_stale="$bsl_dir/lock.stale.$$"
+    if mv "$bsl_dir/lock" "$bsl_stale" 2>/dev/null; then
+        rm -rf "$bsl_stale" 2>/dev/null
+    fi
+    return 0
+}
+
+acquire_lock() {
+    # acquire_lock <dir> -- attempts `mkdir <dir>/lock` (atomic exclusive
+    # create); on success writes $$ to lock/pid and returns 0. If the lock
+    # already exists and is held by a live process, returns 1. If it is
+    # stale, steals it (break_stale_lock) and retries acquisition once.
+    al_dir="$1"
+    if mkdir "$al_dir/lock" 2>/dev/null; then
+        printf '%s\n' "$$" > "$al_dir/lock/pid"
+        return 0
+    fi
+
+    if lock_holder_alive "$al_dir"; then
+        return 1
+    fi
+
+    break_stale_lock "$al_dir"
+
+    if mkdir "$al_dir/lock" 2>/dev/null; then
+        printf '%s\n' "$$" > "$al_dir/lock/pid"
+        return 0
+    fi
+    return 1
+}
+
+release_lock() {
+    # release_lock <dir> -- removes lock/ only if lock/pid still names
+    # this process ($$); a missing pid file under an existing lock/ is
+    # treated as not-ours (refuse to release) since we always write pid
+    # immediately after our own mkdir succeeds.
+    rl_dir="$1"
+    [ -d "$rl_dir/lock" ] || return 0
+    if [ -f "$rl_dir/lock/pid" ]; then
+        rl_holder="$(cat "$rl_dir/lock/pid" 2>/dev/null)"
+        [ "$rl_holder" = "$$" ] || return 1
+    else
+        return 1
+    fi
+    rm -rf "$rl_dir/lock" 2>/dev/null
+    return 0
+}
+
+spawn_dispatcher() {
+    # spawn_dispatcher <uuid> -- unconditionally forks a backgrounded
+    # `paseo-queue _dispatch <uuid>` subshell. The dispatcher itself
+    # competes for the per-agent lock and exits immediately (logging SKIP)
+    # if a live holder already exists, so it is always safe to call this
+    # without checking first (closes the enqueue-vs-exiting-dispatcher
+    # race). PQ_NO_SPAWN=1 disables the fork entirely, for test harnesses
+    # that drive `_dispatch` manually.
+    sd_uuid="$1"
+    if [ "$PQ_NO_SPAWN" = "1" ]; then
+        return 0
+    fi
+    sd_dir="$PQ_HOME/$sd_uuid"
+    ( "$0" _dispatch "$sd_uuid" </dev/null >>"$sd_dir/dispatch.log" 2>&1 & )
+    return 0
+}
+
+pop_oldest() {
+    # pop_oldest <dir> -- prints the filename (not full path) of the
+    # oldest pending message under <dir>/pending, relying on LC_ALL=C glob
+    # ordering over the fixed-width zero-padded FIFO filenames. Prints
+    # nothing and returns 1 if pending/ is empty.
+    po_dir="$1"
+    for po_f in "$po_dir/pending"/*.msg; do
+        [ -e "$po_f" ] || continue
+        printf '%s\n' "${po_f##*/}"
+        return 0
+    done
+    return 1
+}
+
+rotate_log_if_big() {
+    # rotate_log_if_big <dir> -- rotates <dir>/dispatch.log to
+    # dispatch.log.1 (overwriting any previous generation) once it reaches
+    # 5 MiB. Single generation only.
+    rlb_dir="$1"
+    rlb_log="$rlb_dir/dispatch.log"
+    [ -f "$rlb_log" ] || return 0
+    rlb_size="$(pq_file_size "$rlb_log")"
+    if [ -n "$rlb_size" ] && [ "$rlb_size" -ge 5242880 ]; then
+        mv -f "$rlb_log" "$rlb_log.1" 2>/dev/null
+    fi
+    return 0
+}
+
+pq_wait_for_delivery() {
+    # pq_wait_for_delivery <dir> <msgname> <timeout|""> -- implements
+    # `add --wait`: polls once a second. Returns 0 once <msgname> is in
+    # sent/; 1 once it is in failed/ or the dispatcher state is
+    # halted-closed/halted-failed/stalled-daemon (with a reason on
+    # stderr); 4 once <timeout> seconds have elapsed with no resolution
+    # (message stays queued). An empty <timeout> waits indefinitely.
+    wfd_dir="$1"; wfd_msg="$2"; wfd_timeout="$3"
+    wfd_elapsed=0
+    while :; do
+        if [ -e "$wfd_dir/sent/$wfd_msg" ]; then
+            return 0
+        fi
+        if [ -e "$wfd_dir/failed/$wfd_msg" ]; then
+            echo "paseo-queue: add --wait: message moved to failed/ ($wfd_msg)" >&2
+            return 1
+        fi
+        if [ -f "$wfd_dir/state" ]; then
+            wfd_state="$(cat "$wfd_dir/state" 2>/dev/null)"
+            case "$wfd_state" in
+                halted-closed|halted-failed|stalled-daemon)
+                    echo "paseo-queue: add --wait: dispatcher state is $wfd_state" >&2
+                    return 1
+                    ;;
+            esac
+        fi
+        if [ -n "$wfd_timeout" ] && [ "$wfd_elapsed" -ge "$wfd_timeout" ]; then
+            echo "paseo-queue: add --wait-timeout: ${wfd_timeout}s elapsed; message still queued" >&2
+            return 4
+        fi
+        sleep 1
+        wfd_elapsed=$((wfd_elapsed + 1))
+    done
+}
+
+# =====================================================================
+# Subcommands
+# =====================================================================
+
+cmd_add() {
+    [ "$#" -ge 1 ] || die 1 "add: usage: paseo-queue add <agent> [--file f] [--wait] [--wait-timeout s] [--] [text...]"
+    ca_agent_query="$1"; shift
+
+    ca_text=""
+    ca_have_text=0
+    ca_file=""
+    ca_have_file=0
+    ca_wait=0
+    ca_wait_timeout=""
+    ca_use_stdin=0
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --file)
+                shift
+                [ "$#" -gt 0 ] || die 1 "add: --file requires a path argument"
+                ca_file="$1"
+                ca_have_file=1
+                shift
+                ;;
+            --wait)
+                ca_wait=1
+                shift
+                ;;
+            --wait-timeout)
+                shift
+                [ "$#" -gt 0 ] || die 1 "add: --wait-timeout requires a value in seconds"
+                ca_wait_timeout="$1"
+                case "$ca_wait_timeout" in
+                    ''|*[!0-9]*) die 1 "add: --wait-timeout requires a nonnegative integer" ;;
+                esac
+                ca_wait=1
+                shift
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -*)
+                die 1 "add: unknown option: $1"
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    if [ "$#" -gt 0 ]; then
+        ca_text="$*"
+        ca_have_text=1
+    fi
+
+    ca_sources=0
+    [ "$ca_have_text" -eq 1 ] && ca_sources=$((ca_sources + 1))
+    [ "$ca_have_file" -eq 1 ] && ca_sources=$((ca_sources + 1))
+    if [ "$ca_have_text" -eq 0 ] && [ "$ca_have_file" -eq 0 ]; then
+        if [ -t 0 ]; then
+            die 1 "add: no message given (pass text, --file <path>, or pipe stdin)"
+        fi
+        ca_use_stdin=1
+        ca_sources=$((ca_sources + 1))
+    fi
+    if [ "$ca_sources" -gt 1 ]; then
+        die 1 "add: message sources are mutually exclusive (text, --file, stdin)"
+    fi
+
+    ca_resolved="$(resolve_agent "$ca_agent_query" 0)" || exit "$?"
+    pq_split_uuid_name "$ca_resolved"
+    ca_uuid="$PQC_SPLIT_UUID"
+    ca_name="$PQC_SPLIT_NAME"
+    ca_dir="$PQ_HOME/$ca_uuid"
+    ensure_dirs "$ca_dir"
+
+    # Cache "<shortId> <name>" for the orphan escape hatch's display later.
+    ca_short="$(printf '%.7s' "$ca_uuid")"
+    printf '%s %s\n' "$ca_short" "$ca_name" > "$ca_dir/agent.name"
+
+    ca_stage="$ca_dir/tmp/stage.$$"
+    if [ "$ca_have_file" -eq 1 ]; then
+        [ -r "$ca_file" ] || die 1 "add: cannot read --file $ca_file"
+        cp "$ca_file" "$ca_stage" || die 1 "add: failed to stage message"
+    elif [ "$ca_use_stdin" -eq 1 ]; then
+        cat > "$ca_stage" || die 1 "add: failed to read stdin"
+    else
+        printf '%s\n' "$ca_text" > "$ca_stage" || die 1 "add: failed to stage message"
+    fi
+
+    # Hygiene: reject empty/whitespace-only.
+    if [ ! -s "$ca_stage" ] || ! grep -q '[^[:space:]]' "$ca_stage"; then
+        rm -f "$ca_stage"
+        die 1 "add: message is empty or whitespace-only"
+    fi
+
+    # Hygiene: size cap.
+    ca_bytes="$(pq_file_size "$ca_stage")"
+    if [ -n "$ca_bytes" ] && [ "$ca_bytes" -gt "$PQ_MAX_BYTES" ]; then
+        rm -f "$ca_stage"
+        die 1 "add: message exceeds PQ_MAX_BYTES ($PQ_MAX_BYTES bytes); override via PQ_MAX_BYTES"
+    fi
+
+    ca_msgname="$(next_msg_name "$ca_dir")"
+    mv "$ca_stage" "$ca_dir/pending/$ca_msgname" || die 1 "add: failed to enqueue message"
+
+    log_line "$ca_dir" ENQ "$ca_uuid" "$ca_msgname"
+    spawn_dispatcher "$ca_uuid"
+
+    if [ "$ca_wait" -eq 1 ]; then
+        pq_wait_for_delivery "$ca_dir" "$ca_msgname" "$ca_wait_timeout"
+        exit "$?"
+    fi
+
+    exit 0
+}
+
+cmd_ls() {
+    [ -d "$PQ_HOME" ] || exit 0
+    for cl_d in "$PQ_HOME"/*/; do
+        [ -d "$cl_d" ] || continue
+        cl_uuid="$(basename "$cl_d")"
+        cl_name=""
+        [ -f "$cl_d/agent.name" ] && cl_name="$(cut -d' ' -f2- "$cl_d/agent.name" 2>/dev/null)"
+        cl_pending="$(pq_count_msgs "$cl_d/pending")"
+        cl_sent="$(pq_count_msgs "$cl_d/sent")"
+        cl_failed="$(pq_count_msgs "$cl_d/failed")"
+        printf '%s %s: pending=%s sent=%s failed=%s\n' "$cl_uuid" "$cl_name" "$cl_pending" "$cl_sent" "$cl_failed"
+        if [ "$cl_pending" -gt 0 ]; then
+            for cl_f in "$cl_d/pending"/*.msg; do
+                [ -e "$cl_f" ] || continue
+                printf '  pending/%s\n' "${cl_f##*/}"
+            done
+        fi
+    done
+    exit 0
+}
+
+cmd_rm() {
+    [ "$#" -ge 2 ] || die 1 "rm: usage: paseo-queue rm <agent> <msg|--all>"
+    cr_agent_query="$1"
+    cr_target="$2"
+
+    cr_resolved="$(resolve_agent "$cr_agent_query" 1)" || exit "$?"
+    pq_split_uuid_name "$cr_resolved"
+    cr_uuid="$PQC_SPLIT_UUID"
+    cr_dir="$PQ_HOME/$cr_uuid"
+    [ -d "$cr_dir" ] || die 1 "rm: no queue state for $cr_agent_query"
+
+    if [ "$cr_target" = "--all" ]; then
+        cr_removed=0
+        if [ -d "$cr_dir/pending" ]; then
+            for cr_f in "$cr_dir/pending"/*.msg; do
+                [ -e "$cr_f" ] || continue
+                rm -f "$cr_f"
+                cr_removed=$((cr_removed + 1))
+            done
+        fi
+        log_line "$cr_dir" CANCEL "$cr_uuid" "--all ($cr_removed removed)"
+        if pq_dir_is_empty "$cr_dir" && ! pq_agent_known "$cr_uuid"; then
+            rm -rf "$cr_dir"
+        fi
+        exit 0
+    fi
+
+    cr_msgfile="$cr_dir/pending/$cr_target"
+    [ -e "$cr_msgfile" ] || die 1 "rm: no such pending message: $cr_target"
+    rm -f "$cr_msgfile" || die 1 "rm: failed to remove $cr_target"
+    log_line "$cr_dir" CANCEL "$cr_uuid" "$cr_target"
+    exit 0
+}
+
+cmd_status() {
+    if ! pq_fetch_ls_json; then
+        echo "paseo-queue: status: paseo ls --json failed (daemon unreachable?)" >&2
+        exit 3
+    fi
+
+    [ -d "$PQ_HOME" ] || exit 0
+
+    for cs_d in "$PQ_HOME"/*/; do
+        [ -d "$cs_d" ] || continue
+        cs_uuid="$(basename "$cs_d")"
+        cs_name=""
+        [ -f "$cs_d/agent.name" ] && cs_name="$(cut -d' ' -f2- "$cs_d/agent.name" 2>/dev/null)"
+
+        cs_orphan_tag=""
+        if ! pq_agent_known "$cs_uuid"; then
+            cs_orphan_tag=" ORPHANED"
+        fi
+
+        cs_state="unknown"
+        [ -f "$cs_d/state" ] && cs_state="$(cat "$cs_d/state" 2>/dev/null)"
+
+        cs_pending="$(pq_count_msgs "$cs_d/pending")"
+        cs_sent="$(pq_count_msgs "$cs_d/sent")"
+        cs_failed="$(pq_count_msgs "$cs_d/failed")"
+
+        cs_dpid="none"
+        cs_dalive="down"
+        if [ -f "$cs_d/lock/pid" ]; then
+            cs_dpid="$(cat "$cs_d/lock/pid" 2>/dev/null)"
+            if lock_holder_alive "$cs_d"; then
+                cs_dalive="up"
+            fi
+        fi
+
+        printf '%s %s%s: state=%s pending=%s sent=%s failed=%s dispatcher=%s(pid=%s)\n' \
+            "$cs_uuid" "$cs_name" "$cs_orphan_tag" "$cs_state" "$cs_pending" "$cs_sent" "$cs_failed" "$cs_dalive" "$cs_dpid"
+
+        if [ "$cs_pending" -gt 0 ] && [ "$cs_dalive" != "up" ]; then
+            echo "paseo-queue: WARN: $cs_uuid has pending messages but no live dispatcher; run: paseo-queue drain $cs_uuid" >&2
+        fi
+        if [ "$cs_state" = "holding-permission" ]; then
+            echo "paseo-queue: WARN: $cs_uuid dispatcher is holding-permission (needs human attention)" >&2
+        fi
+    done
+
+    exit 0
+}
+
+cmd_drain() {
+    [ "$#" -ge 1 ] || die 1 "drain: usage: paseo-queue drain <agent>"
+    cd_agent_query="$1"
+    cd_resolved="$(resolve_agent "$cd_agent_query" 0)" || exit "$?"
+    pq_split_uuid_name "$cd_resolved"
+    cd_uuid="$PQC_SPLIT_UUID"
+    cd_dir="$PQ_HOME/$cd_uuid"
+    ensure_dirs "$cd_dir"
+    spawn_dispatcher "$cd_uuid"
+    exit 0
+}
+
+cmd_stop() {
+    [ "$#" -ge 1 ] || die 1 "stop: usage: paseo-queue stop <agent>"
+    ct_agent_query="$1"
+    ct_resolved="$(resolve_agent "$ct_agent_query" 1)" || exit "$?"
+    pq_split_uuid_name "$ct_resolved"
+    ct_uuid="$PQC_SPLIT_UUID"
+    ct_dir="$PQ_HOME/$ct_uuid"
+    [ -d "$ct_dir" ] || die 1 "stop: no queue state for $ct_agent_query"
+
+    if [ -f "$ct_dir/lock/pid" ] && lock_holder_alive "$ct_dir"; then
+        ct_pid="$(cat "$ct_dir/lock/pid" 2>/dev/null)"
+        kill -TERM "$ct_pid" 2>/dev/null
+        log_line "$ct_dir" STOP "$ct_uuid" "pid=$ct_pid"
+        exit 0
+    fi
+
+    echo "paseo-queue: stop: no live dispatcher for $ct_agent_query" >&2
+    exit 1
+}
+
+cmd_log() {
+    [ "$#" -ge 1 ] || die 1 "log: usage: paseo-queue log <agent> [-n N] [-f]"
+    cg_agent_query="$1"; shift
+    cg_n=20
+    cg_follow=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -n)
+                shift
+                [ "$#" -gt 0 ] || die 1 "log: -n requires a value"
+                cg_n="$1"
+                case "$cg_n" in ''|*[!0-9]*) die 1 "log: -n requires a nonnegative integer" ;; esac
+                shift
+                ;;
+            -f)
+                cg_follow=1
+                shift
+                ;;
+            *)
+                die 1 "log: unknown option: $1"
+                ;;
+        esac
+    done
+
+    cg_resolved="$(resolve_agent "$cg_agent_query" 1)" || exit "$?"
+    pq_split_uuid_name "$cg_resolved"
+    cg_dir="$PQ_HOME/$PQC_SPLIT_UUID"
+    cg_log="$cg_dir/dispatch.log"
+    [ -f "$cg_log" ] || die 1 "log: no log for $cg_agent_query"
+
+    if [ "$cg_follow" -eq 1 ]; then
+        tail -n "$cg_n" -f "$cg_log"
+    else
+        tail -n "$cg_n" "$cg_log"
+    fi
+    exit 0
 }
 
 # --- Main dispatch ---------------------------------------------------------
@@ -47,9 +870,26 @@ main() {
             usage
             exit 0
             ;;
-        add|ls|rm|status|drain|stop|log)
-            echo "paseo-queue: $cmd: not implemented" >&2
-            exit 1
+        add)
+            cmd_add "$@"
+            ;;
+        ls)
+            cmd_ls "$@"
+            ;;
+        rm)
+            cmd_rm "$@"
+            ;;
+        status)
+            cmd_status "$@"
+            ;;
+        drain)
+            cmd_drain "$@"
+            ;;
+        stop)
+            cmd_stop "$@"
+            ;;
+        log)
+            cmd_log "$@"
             ;;
         _dispatch)
             # Hidden per-agent dispatcher entry point (see plan Design
