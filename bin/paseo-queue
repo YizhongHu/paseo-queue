@@ -18,6 +18,12 @@ PQ_SEND_RETRIES="${PASEO_QUEUE_SEND_RETRIES:-5}"
 PQ_DAEMON_RETRIES="${PASEO_QUEUE_DAEMON_RETRIES:-15}"
 PQ_HOLD_LOG_EVERY="${PASEO_QUEUE_HOLD_LOG_EVERY:-300}"
 PQ_NO_SPAWN="${PASEO_QUEUE_NO_SPAWN:-0}"
+# Internal-only knob (not part of the design plan's public knob list): scales
+# every _dispatch backoff schedule (daemon/hold-permission/send-retry) so
+# tests can shrink them to near-zero without changing which branch is
+# exercised. Never used by end users; documented in usage() for completeness.
+PQ_BACKOFF_SCALE="${PASEO_QUEUE_BACKOFF_SCALE:-1}"
+case "$PQ_BACKOFF_SCALE" in ''|*[!0-9]*) PQ_BACKOFF_SCALE=1 ;; esac
 
 LC_ALL=C
 export LC_ALL
@@ -179,6 +185,8 @@ Environment knobs (all test-overridable):
   PASEO_QUEUE_DAEMON_RETRIES    Transient daemon-unreachable retry count (default: 15)
   PASEO_QUEUE_HOLD_LOG_EVERY    Rate limit for HOLD-PERM log lines, seconds (default: 300)
   PASEO_QUEUE_NO_SPAWN          Set to 1 to disable dispatcher auto-spawn (tests only)
+  PASEO_QUEUE_BACKOFF_SCALE     Multiplier for _dispatch backoff sleeps, nonnegative
+                                integer (default: 1; tests only)
 
 Exit codes:
   0  ok
@@ -862,6 +870,378 @@ cmd_log() {
     exit 0
 }
 
+# =====================================================================
+# Dispatcher (_dispatch <uuid>) -- see the design plan's "Design (hardened
+# spec)" section: Spawn-race protocol, Locking, Send gating, Failure
+# taxonomy, Delivery modes, Log. Runs as a long-lived per-agent process
+# forked by spawn_dispatcher(); it competes for the per-agent lock itself,
+# so it is always safe to fork speculatively (closes the
+# enqueue-vs-exiting-dispatcher race: no separate check-then-spawn window).
+# =====================================================================
+
+dp_lock_is_stale() {
+    # dp_lock_is_stale <dir> -- true iff <dir>/lock exists but its current
+    # holder is not live. Read-only pre-check; used only to decide whether a
+    # subsequent successful acquire_lock() call gets logged as STEAL vs
+    # START -- acquire_lock() itself performs the actual steal internally
+    # (mkdir/break_stale_lock), so this never duplicates that logic.
+    dls_dir="$1"
+    [ -d "$dls_dir/lock" ] || return 1
+    lock_holder_alive "$dls_dir" && return 1
+    return 0
+}
+
+dp_scale_seconds() {
+    # dp_scale_seconds <seconds> -- applies PQ_BACKOFF_SCALE (default 1,
+    # override via PASEO_QUEUE_BACKOFF_SCALE) so tests can shrink the
+    # dispatcher's backoff schedules to near-zero without changing which
+    # branch is exercised.
+    printf '%s\n' $(( $1 * PQ_BACKOFF_SCALE ))
+}
+
+dp_sleep_seconds() {
+    # dp_sleep_seconds <seconds> -- sleeps in 1s increments (rather than one
+    # long sleep) so INT/TERM traps stay responsive during backoff.
+    dss_total="$1"
+    dss_elapsed=0
+    while [ "$dss_elapsed" -lt "$dss_total" ]; do
+        sleep 1
+        dss_elapsed=$((dss_elapsed + 1))
+    done
+}
+
+dp_daemon_backoff() {
+    # dp_daemon_backoff <attempt> -- transient-daemon schedule: 10,30,60,60...
+    case "$1" in
+        1) echo 10 ;;
+        2) echo 30 ;;
+        *) echo 60 ;;
+    esac
+}
+
+dp_hold_backoff() {
+    # dp_hold_backoff <attempt> -- holding-permission schedule: 5,10,20,30,60
+    # capped at 60 (run after `paseo wait`, which can return instantly on the
+    # daemon's permission-resolved broadcast release -- this backoff exists
+    # to prevent a hot loop while nperms stays > 0).
+    case "$1" in
+        1) echo 5 ;;
+        2) echo 10 ;;
+        3) echo 20 ;;
+        4) echo 30 ;;
+        *) echo 60 ;;
+    esac
+}
+
+dp_send_backoff() {
+    # dp_send_backoff <attempt> -- transient-message retry schedule:
+    # 5,15,30,60,60...
+    case "$1" in
+        1) echo 5 ;;
+        2) echo 15 ;;
+        3) echo 30 ;;
+        *) echo 60 ;;
+    esac
+}
+
+dp_log_hold_perm() {
+    # dp_log_hold_perm <n> <msg> -- logs HOLD-PERM rate-limited to once per
+    # PQ_HOLD_LOG_EVERY seconds (tracked in the dp_hold_last_log global,
+    # reset to 0 at dispatcher start so the first occurrence always logs).
+    dlh_now="$(date +%s)"
+    if [ $(( dlh_now - dp_hold_last_log )) -ge "$PQ_HOLD_LOG_EVERY" ]; then
+        log_line "$dp_dir" HOLD-PERM "n=$1" "msg=$2"
+        dp_hold_last_log="$dlh_now"
+    fi
+}
+
+dp_log_wait_busy() {
+    # dp_log_wait_busy <msg> -- logs WAIT-BUSY rate-limited to once per
+    # PQ_HOLD_LOG_EVERY seconds (same rate limit as HOLD-PERM, tracked
+    # separately in dp_busy_last_log).
+    dlw_now="$(date +%s)"
+    if [ $(( dlw_now - dp_busy_last_log )) -ge "$PQ_HOLD_LOG_EVERY" ]; then
+        log_line "$dp_dir" WAIT-BUSY "msg=$1"
+        dp_busy_last_log="$dlw_now"
+    fi
+}
+
+dp_inspect_classify() {
+    # dp_inspect_classify <uuid> -- one fresh inspect_agent call; prints
+    # "<class> <status> <archived> <nperms>" to stdout where <class> is:
+    #   daemon -- the inspect call itself failed (transient-daemon path)
+    #   halt   -- archived, status=closed, or status=unknown (inspect_agent's
+    #             own fallback for missing/malformed data; folded into the
+    #             permanent not-found/closed case)
+    #   live   -- agent responded, not archived, not closed
+    # Used both for the pre-send gating check (every loop iteration) and to
+    # classify a send failure via a follow-up call, per the failure taxonomy.
+    dic_out="$(inspect_agent "$1")"
+    dic_rc=$?
+    if [ "$dic_rc" -ne 0 ]; then
+        printf 'daemon\n'
+        return 0
+    fi
+    dic_status="$(printf '%s' "$dic_out" | cut -d' ' -f1)"
+    dic_archived="$(printf '%s' "$dic_out" | cut -d' ' -f2)"
+    dic_nperms="$(printf '%s' "$dic_out" | cut -d' ' -f3)"
+    case "$dic_status" in
+        closed|unknown)
+            printf 'halt %s %s %s\n' "$dic_status" "$dic_archived" "$dic_nperms"
+            return 0
+            ;;
+    esac
+    if [ "$dic_archived" = "1" ]; then
+        printf 'halt %s %s %s\n' "$dic_status" "$dic_archived" "$dic_nperms"
+        return 0
+    fi
+    printf 'live %s %s %s\n' "$dic_status" "$dic_archived" "$dic_nperms"
+    return 0
+}
+
+dp_cleanup_on_signal() {
+    # dp_cleanup_on_signal <INT|TERM> -- trap target. Disarms itself first
+    # (reentrancy guard against a second signal arriving mid-cleanup), then
+    # releases the lock, sets state, logs EXIT, and exits with the
+    # conventional 128+signum code.
+    dp_sig="${1:-TERM}"
+    trap - INT TERM
+    release_lock "$dp_dir"
+    set_state "$dp_dir" stopped
+    log_line "$dp_dir" EXIT "reason=signal" "sig=$dp_sig"
+    rm -f "$dp_stderr_tmp"
+    case "$dp_sig" in
+        INT) exit 130 ;;
+        *) exit 143 ;;
+    esac
+}
+
+dp_exit() {
+    # dp_exit <code> -- normal (non-signal) exit path shared by every HALT/
+    # FATAL branch. Disarms the INT/TERM trap FIRST so a signal arriving
+    # during this cleanup can't also fire dp_cleanup_on_signal and
+    # double-release the lock or double-log EXIT, then releases the lock,
+    # cleans up the per-process stderr capture file, and exits <code>.
+    trap - INT TERM
+    release_lock "$dp_dir"
+    rm -f "$dp_stderr_tmp"
+    exit "$1"
+}
+
+dp_handle_empty_queue() {
+    # dp_handle_empty_queue -- empty-queue exit protocol (plan "Spawn-race
+    # protocol", race-closure half). Lingers PQ_LINGER seconds polling for a
+    # new arrival (returns 0 to resume the main loop the instant one shows
+    # up); otherwise releases the lock and re-checks pending/ once more --
+    # non-empty means an add() raced in right at the boundary, so try to
+    # reacquire (REACQUIRE resumes; YIELD means the racer's own spawned
+    # dispatcher won the reacquire race, so exit 0 and let it work); still
+    # empty after the release means a clean stop.
+    log_line "$dp_dir" LINGER "pending=0"
+    set_state "$dp_dir" idle-drain
+
+    dp_lingered=0
+    while :; do
+        if pop_oldest "$dp_dir" >/dev/null 2>&1; then
+            return 0
+        fi
+        [ "$dp_lingered" -ge "$PQ_LINGER" ] && break
+        sleep 1
+        dp_lingered=$((dp_lingered + 1))
+    done
+
+    trap - INT TERM
+    release_lock "$dp_dir"
+
+    if pop_oldest "$dp_dir" >/dev/null 2>&1; then
+        if acquire_lock "$dp_dir"; then
+            log_line "$dp_dir" REACQUIRE "pending work found post-release"
+            trap 'dp_cleanup_on_signal INT' INT
+            trap 'dp_cleanup_on_signal TERM' TERM
+            return 0
+        fi
+        log_line "$dp_dir" YIELD "lock taken by another dispatcher after release"
+        rm -f "$dp_stderr_tmp"
+        exit 0
+    fi
+
+    set_state "$dp_dir" stopped
+    log_line "$dp_dir" EXIT "reason=empty"
+    rm -f "$dp_stderr_tmp"
+    exit 0
+}
+
+cmd_dispatch() {
+    # cmd_dispatch <uuid> -- the hidden `_dispatch` subcommand body: the
+    # long-lived per-agent dispatcher. See the plan's "Design (hardened
+    # spec)" section for the full protocol implemented below.
+    [ "$#" -ge 1 ] || die 1 "_dispatch: usage: paseo-queue _dispatch <uuid>"
+    dp_uuid="$1"
+    dp_dir="$PQ_HOME/$dp_uuid"
+    ensure_dirs "$dp_dir"
+
+    dp_was_stale=0
+    dp_lock_is_stale "$dp_dir" && dp_was_stale=1
+
+    if ! acquire_lock "$dp_dir"; then
+        dp_holder_pid="none"
+        [ -f "$dp_dir/lock/pid" ] && dp_holder_pid="$(cat "$dp_dir/lock/pid" 2>/dev/null)"
+        log_line "$dp_dir" SKIP "$dp_uuid" "lock held by live dispatcher pid=$dp_holder_pid"
+        exit 0
+    fi
+
+    if [ "$dp_was_stale" -eq 1 ]; then
+        log_line "$dp_dir" STEAL "$dp_uuid" "stale lock cleared"
+    fi
+
+    dp_stderr_tmp="$dp_dir/tmp/stderr.$$"
+
+    trap 'dp_cleanup_on_signal INT' INT
+    trap 'dp_cleanup_on_signal TERM' TERM
+
+    set_state "$dp_dir" running
+    log_line "$dp_dir" START "$dp_uuid" "pid=$$"
+
+    dp_daemon_fail_count=0
+    dp_send_fail_count=0
+    dp_send_fail_msg=""
+    dp_hold_backoff_count=0
+    dp_hold_last_log=0
+    dp_busy_last_log=0
+
+    while :; do
+        rotate_log_if_big "$dp_dir"
+
+        dp_msg="$(pop_oldest "$dp_dir")"
+        if [ -z "$dp_msg" ]; then
+            dp_handle_empty_queue
+            continue
+        fi
+
+        # Per-message retry counter resets whenever the oldest pending
+        # message changes (a prior message left pending/, or this one is new).
+        if [ "$dp_msg" != "$dp_send_fail_msg" ]; then
+            dp_send_fail_count=0
+            dp_send_fail_msg="$dp_msg"
+        fi
+
+        dp_class="$(dp_inspect_classify "$dp_uuid")"
+        dp_kind="$(printf '%s' "$dp_class" | cut -d' ' -f1)"
+
+        if [ "$dp_kind" = "daemon" ]; then
+            dp_daemon_fail_count=$((dp_daemon_fail_count + 1))
+            set_state "$dp_dir" daemon-retry
+            if [ "$dp_daemon_fail_count" -ge "$PQ_DAEMON_RETRIES" ]; then
+                log_line "$dp_dir" FATAL "reason=daemon-unreachable" "pending=$(pq_count_msgs "$dp_dir/pending")"
+                set_state "$dp_dir" stalled-daemon
+                dp_exit 1
+            fi
+            dp_sleep_seconds "$(dp_scale_seconds "$(dp_daemon_backoff "$dp_daemon_fail_count")")"
+            continue
+        fi
+        dp_daemon_fail_count=0
+
+        dp_status="$(printf '%s' "$dp_class" | cut -d' ' -f2)"
+        dp_archived="$(printf '%s' "$dp_class" | cut -d' ' -f3)"
+        dp_nperms="$(printf '%s' "$dp_class" | cut -d' ' -f4)"
+
+        if [ "$dp_kind" = "halt" ]; then
+            log_line "$dp_dir" HALT "reason=closed" "pending=$(pq_count_msgs "$dp_dir/pending")"
+            set_state "$dp_dir" halted-closed
+            dp_exit 0
+        fi
+
+        if [ "$dp_nperms" -gt 0 ]; then
+            set_state "$dp_dir" holding-permission
+            dp_log_hold_perm "$dp_nperms" "$dp_msg"
+            paseo wait "$dp_uuid" --timeout "$PQ_WAIT_TIMEOUT" --json >/dev/null 2>&1
+            dp_hold_backoff_count=$((dp_hold_backoff_count + 1))
+            dp_sleep_seconds "$(dp_scale_seconds "$(dp_hold_backoff "$dp_hold_backoff_count")")"
+            continue
+        fi
+        dp_hold_backoff_count=0
+
+        if [ "$dp_status" = "running" ]; then
+            set_state "$dp_dir" waiting
+            dp_log_wait_busy "$dp_msg"
+            paseo wait "$dp_uuid" --timeout "$PQ_WAIT_TIMEOUT" --json >/dev/null 2>&1
+            continue
+        fi
+
+        # idle, not archived, no pending permissions: attempt delivery.
+        if [ ! -e "$dp_dir/pending/$dp_msg" ]; then
+            log_line "$dp_dir" CANCEL "$dp_msg" "removed before send"
+            continue
+        fi
+
+        set_state "$dp_dir" sending
+        log_line "$dp_dir" SEND-BEGIN "$dp_msg"
+        dp_t0="$(date +%s)"
+        paseo send "$dp_uuid" --prompt-file "$dp_dir/pending/$dp_msg" >/dev/null 2>"$dp_stderr_tmp"
+        dp_send_rc=$?
+        dp_t1="$(date +%s)"
+        dp_dur=$((dp_t1 - dp_t0))
+
+        if [ "$dp_send_rc" -eq 0 ]; then
+            dp_bytes="$(pq_file_size "$dp_dir/pending/$dp_msg")"
+            mv -f "$dp_dir/pending/$dp_msg" "$dp_dir/sent/$dp_msg"
+            log_line "$dp_dir" SEND-OK "msg=$dp_msg" "bytes=$dp_bytes" "dur=${dp_dur}s"
+            dp_send_fail_count=0
+            dp_daemon_fail_count=0
+            rm -f "$dp_stderr_tmp"
+            continue
+        fi
+
+        # Send failed: classify via a follow-up inspect (failure taxonomy).
+        dp_class2="$(dp_inspect_classify "$dp_uuid")"
+        dp_kind2="$(printf '%s' "$dp_class2" | cut -d' ' -f1)"
+
+        if [ "$dp_kind2" = "daemon" ]; then
+            log_line "$dp_dir" SEND-FAIL "msg=$dp_msg" "rc=$dp_send_rc" "reason=daemon"
+            dp_daemon_fail_count=$((dp_daemon_fail_count + 1))
+            set_state "$dp_dir" daemon-retry
+            if [ "$dp_daemon_fail_count" -ge "$PQ_DAEMON_RETRIES" ]; then
+                log_line "$dp_dir" FATAL "reason=daemon-unreachable" "pending=$(pq_count_msgs "$dp_dir/pending")"
+                set_state "$dp_dir" stalled-daemon
+                dp_exit 1
+            fi
+            dp_sleep_seconds "$(dp_scale_seconds "$(dp_daemon_backoff "$dp_daemon_fail_count")")"
+            continue
+        fi
+
+        if [ "$dp_kind2" = "halt" ]; then
+            log_line "$dp_dir" SEND-FAIL "msg=$dp_msg" "rc=$dp_send_rc" "reason=closed"
+            log_line "$dp_dir" HALT "reason=closed" "pending=$(pq_count_msgs "$dp_dir/pending")"
+            set_state "$dp_dir" halted-closed
+            dp_exit 0
+        fi
+
+        # Agent alive: transient-message failure. Halt (don't skip) once the
+        # per-message retry budget is exhausted -- later messages may depend
+        # on this one, so we never advance to the next pending message here.
+        dp_send_fail_count=$((dp_send_fail_count + 1))
+        log_line "$dp_dir" SEND-FAIL "msg=$dp_msg" "rc=$dp_send_rc"
+
+        if [ "$dp_send_fail_count" -ge "$PQ_SEND_RETRIES" ]; then
+            dp_err="$dp_dir/failed/$dp_msg.err"
+            {
+                printf 'timestamp=%s\n' "$(TZ=UTC date '+%Y-%m-%dT%H:%M:%SZ')"
+                printf 'rc=%s\n' "$dp_send_rc"
+                printf -- '--- stderr (last 2000 bytes) ---\n'
+                [ -s "$dp_stderr_tmp" ] && tail -c 2000 "$dp_stderr_tmp"
+            } > "$dp_err" 2>/dev/null
+            mv -f "$dp_dir/pending/$dp_msg" "$dp_dir/failed/$dp_msg"
+            log_line "$dp_dir" MOVE-FAILED "msg=$dp_msg"
+            log_line "$dp_dir" FATAL "reason=message-failed" "msg=$dp_msg"
+            set_state "$dp_dir" halted-failed
+            dp_exit 1
+        fi
+
+        log_line "$dp_dir" RETRY "attempt=$dp_send_fail_count/$PQ_SEND_RETRIES" "msg=$dp_msg"
+        dp_sleep_seconds "$(dp_scale_seconds "$(dp_send_backoff "$dp_send_fail_count")")"
+    done
+}
+
 # --- Main dispatch ---------------------------------------------------------
 main() {
     cmd="${1:-}"
@@ -895,9 +1275,8 @@ main() {
             ;;
         _dispatch)
             # Hidden per-agent dispatcher entry point (see plan Design
-            # section: spawn-race protocol). Stub until step 3.
-            echo "paseo-queue: _dispatch: not implemented" >&2
-            exit 1
+            # section: spawn-race protocol).
+            cmd_dispatch "$@"
             ;;
         *)
             usage >&2
