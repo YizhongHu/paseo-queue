@@ -3,9 +3,9 @@
 #
 # Installs:
 #   1. ~/.local/bin/paseo-queue         -> symlink to <repo>/bin/paseo-queue
-#   2. ~/.claude/skills/paseo-queue/    -> copy of skill/SKILL.md
-#   3. ~/.codex/skills/paseo-queue/     -> copy of skill/SKILL.md
-#   4. ~/.agents/skills/paseo-queue/    -> copy of skill/SKILL.md
+#   2. ~/.claude/skills/paseo-queue/    -> copy of skills/paseo-queue/SKILL.md
+#   3. ~/.codex/skills/paseo-queue/     -> copy of skills/paseo-queue/SKILL.md
+#   4. ~/.agents/skills/paseo-queue/    -> copy of skills/paseo-queue/SKILL.md
 #
 # Safe to re-run: every step below is idempotent (chmod, ln -sf, mkdir -p,
 # cp -f). Touches nothing outside the four locations above.
@@ -26,7 +26,7 @@ ln -sf "$REPO_DIR/bin/paseo-queue" "$HOME/.local/bin/paseo-queue"
 # 3. Install the skill into every skill directory Paseo-managed agents read.
 for skills_root in "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.agents/skills"; do
     mkdir -p "$skills_root/paseo-queue"
-    cp -f "$REPO_DIR/skill/SKILL.md" "$skills_root/paseo-queue/SKILL.md"
+    cp -f "$REPO_DIR/skills/paseo-queue/SKILL.md" "$skills_root/paseo-queue/SKILL.md"
 done
 
 # 4. Verify: the CLI must resolve on PATH and run.
@@ -43,4 +43,4 @@ if ! paseo-queue --help >/dev/null 2>&1; then
     exit 1
 fi
 
-echo "install.sh: SUCCESS - installed $HOME/.local/bin/paseo-queue (-> $REPO_DIR/bin/paseo-queue) and skill/SKILL.md into $HOME/.claude/skills/paseo-queue, $HOME/.codex/skills/paseo-queue, $HOME/.agents/skills/paseo-queue"
+echo "install.sh: SUCCESS - installed $HOME/.local/bin/paseo-queue (-> $REPO_DIR/bin/paseo-queue) and skills/paseo-queue/SKILL.md into $HOME/.claude/skills/paseo-queue, $HOME/.codex/skills/paseo-queue, $HOME/.agents/skills/paseo-queue"

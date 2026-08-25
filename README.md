@@ -37,9 +37,9 @@ locations:
 
 - `~/.local/bin/paseo-queue` — a symlink to this repo's `bin/paseo-queue`,
   put on `PATH`.
-- `~/.claude/skills/paseo-queue/SKILL.md` — copy of `skill/SKILL.md`.
-- `~/.codex/skills/paseo-queue/SKILL.md` — copy of `skill/SKILL.md`.
-- `~/.agents/skills/paseo-queue/SKILL.md` — copy of `skill/SKILL.md`.
+- `~/.claude/skills/paseo-queue/SKILL.md` — copy of `skills/paseo-queue/SKILL.md`.
+- `~/.codex/skills/paseo-queue/SKILL.md` — copy of `skills/paseo-queue/SKILL.md`.
+- `~/.agents/skills/paseo-queue/SKILL.md` — copy of `skills/paseo-queue/SKILL.md`.
 
 It then verifies the install by running `command -v paseo-queue` and
 `paseo-queue --help`, and prints `SUCCESS`/`FAILED` accordingly.
@@ -66,16 +66,16 @@ non-emergency coordination.
 
 ## Skill backups
 
-The repository retains durable copies of the coordination skills so a Paseo
-managed refresh cannot erase the local policy:
+`skills/paseo-queue/SKILL.md` is the single canonical source for the
+installed skill: `install.sh` reads it directly and copies it into every
+skill root (see Install above). Running `./install.sh` restores it if a
+Paseo-managed refresh ever erases the installed copies.
 
-- `skills/paseo/SKILL.md`
-- `skills/paseo-message-agent/SKILL.md`
-- `skills/paseo-queue/SKILL.md`
-
-`skill/SKILL.md` remains the installer-compatible copy of
-`skills/paseo-queue/SKILL.md`. Running `./install.sh` restores that queue skill;
-the other two snapshots can be copied back to any affected skill root.
+`skills/paseo/SKILL.md` and `skills/paseo-message-agent/SKILL.md` are tracked
+backups of the user's personal-skill edits for those two unrelated skills
+(both cross-reference `paseo-queue`). They are not installed by `install.sh`
+and are not touched by it; if ever needed, copy them back to the affected
+skill root manually.
 
 ## Usage
 
