@@ -1,0 +1,403 @@
+#!/bin/sh
+# tests/mock/paseo: file-driven shim standing in for the real `paseo` CLI
+# during tests/t-*.sh. Never touches a real Paseo daemon; every subcommand
+# it supports (ls/inspect/wait/send) is driven entirely by files under
+# $MOCK_DIR, which common.sh's setup() creates per-sandbox and exports so
+# detached dispatchers (spawn_dispatcher's backgrounded `_dispatch`) inherit
+# it too.
+#
+# POSIX sh only (see AGENTS.md): no jq/flock/setsid/local/arrays, target
+# macOS /bin/sh = bash 3.2 in sh mode.
+#
+# --- File formats under $MOCK_DIR -----------------------------------------
+#   agents.tsv   one row per known agent, tab-separated:
+#                  uuid  shortId  name  status  archived(0/1)  nperms
+#                Values contain no quotes (documented harness constraint) --
+#                this lets JSON be built with plain printf, no escaping.
+#                Drives `ls --json` (camelCase array) and
+#                `inspect <id> --json` (PascalCase object; PendingPermissions
+#                is a dummy array of length <nperms>).
+#   wait.script  one scripted line per `wait` call, consumed in order:
+#                  "after=N result=idle|permission|timeout [set_status=...]"
+#                Missing file / already exhausted: sleep 1s, report the
+#                agent's current status (no mutation).
+#   send.script  one scripted line per `send` call, consumed in order:
+#                  "rc=0"
+#                  "rc=1 err=<text>"
+#                  "rc=1 set_status=closed"
+#                Missing file / already exhausted: models Paseo's real
+#                blocking-until-turn-complete `send` -- flips status to
+#                running then idle and succeeds (rc=0).
+#   down         toggle file (any content, existence only matters): while
+#                present, EVERY subcommand exits 7 with "connection
+#                refused" on stderr (simulates a daemon-down window).
+#   calls.log    argv of every invocation (tab-separated), appended even
+#                while `down` is in effect.
+#   send.log     one line per *successful* delivery (rc=0 sends only):
+#                  uuid<TAB>cksum-of-prompt-file<TAB>seq
+#                <seq> is a global 1-indexed delivery counter -- the
+#                ordering oracle tests use to assert FIFO delivery order.
+#   sent.d/NNN   verbatim copy of each delivered prompt file, named by the
+#                same zero-padded <seq> (NNN = %03d).
+#   wait.n       count of wait.script lines consumed so far (see
+#                mock_next_line).
+#   send.n       count of send.script lines consumed so far.
+#   deliver.n    the send.log/sent.d sequence counter (see mock_next_seq).
+#
+# Script files must end each line with a trailing newline (the
+# mock_set_wait_script/mock_set_send_script helpers in tests/common.sh
+# guarantee this) -- `wc -l`-based exhaustion detection below undercounts a
+# final line missing its newline.
+set -u
+LC_ALL=C
+export LC_ALL
+
+: "${MOCK_DIR:?MOCK_DIR must be set (mock paseo shim requires a sandboxed MOCK_DIR)}"
+
+# =====================================================================
+# Small primitives
+# =====================================================================
+
+mock_kv() {
+    # mock_kv <line> <key> -- prints the value of the first "<key>=..."
+    # whitespace-separated token in <line>; returns 1 if <key> is absent.
+    # Relies on default IFS word-splitting over <line>, which is safe here
+    # because scripted values never contain embedded spaces.
+    mk_line="$1"; mk_key="$2"
+    for mk_tok in $mk_line; do
+        case "$mk_tok" in
+            "$mk_key"=*)
+                printf '%s\n' "${mk_tok#*=}"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+mock_lock_incr() {
+    # mock_lock_incr <lockdir> -- best-effort mutual exclusion via mkdir
+    # (same idiom bin/paseo-queue itself uses for its per-agent lock/):
+    # busy-waits (no external `sleep` needed for a microseconds-long
+    # critical section) up to a bounded number of attempts, then proceeds
+    # unlocked as a last resort so a wedged lock can never hang a test.
+    mli_dir="$1"
+    mli_tries=0
+    while ! mkdir "$mli_dir" 2>/dev/null; do
+        mli_tries=$((mli_tries + 1))
+        [ "$mli_tries" -ge 2000 ] && break
+    done
+    return 0
+}
+
+mock_next_line() {
+    # mock_next_line <script-file> <counter-file> -- prints the next
+    # unconsumed (1-indexed) line from <script-file> to stdout and
+    # increments <counter-file> (created at 0 if absent). Prints nothing
+    # and returns 1 if <script-file> is missing or already exhausted.
+    mnl_script="$1"; mnl_counter="$2"
+    mnl_lockdir="$mnl_counter.lock"
+    mock_lock_incr "$mnl_lockdir"
+
+    mnl_n=0
+    [ -f "$mnl_counter" ] && mnl_n="$(cat "$mnl_counter" 2>/dev/null)"
+    case "$mnl_n" in ''|*[!0-9]*) mnl_n=0 ;; esac
+    mnl_next=$((mnl_n + 1))
+
+    mnl_total=0
+    if [ -f "$mnl_script" ]; then
+        mnl_total="$(wc -l < "$mnl_script" 2>/dev/null | tr -d ' ')"
+    fi
+    case "$mnl_total" in ''|*[!0-9]*) mnl_total=0 ;; esac
+
+    if [ "$mnl_next" -gt "$mnl_total" ]; then
+        rmdir "$mnl_lockdir" 2>/dev/null
+        return 1
+    fi
+
+    printf '%s\n' "$mnl_next" > "$mnl_counter"
+    rmdir "$mnl_lockdir" 2>/dev/null
+    sed -n "${mnl_next}p" "$mnl_script"
+    return 0
+}
+
+mock_next_seq() {
+    # mock_next_seq <counter-file> -- atomically increments and prints a
+    # 1-indexed sequence number from <counter-file> (created at 0 if
+    # absent). Used for send.log / sent.d's global delivery ordering.
+    mns_counter="$1"
+    mns_lockdir="$mns_counter.lock"
+    mock_lock_incr "$mns_lockdir"
+
+    mns_n=0
+    [ -f "$mns_counter" ] && mns_n="$(cat "$mns_counter" 2>/dev/null)"
+    case "$mns_n" in ''|*[!0-9]*) mns_n=0 ;; esac
+    mns_next=$((mns_n + 1))
+    printf '%s\n' "$mns_next" > "$mns_counter"
+
+    rmdir "$mns_lockdir" 2>/dev/null
+    printf '%s\n' "$mns_next"
+}
+
+# Set by mock_lookup_agent() on success: MOCK_ROW_{UUID,SHORT,NAME,STATUS,
+# ARCHIVED,NPERMS}. Modeled on the project's own pq_split_uuid_name()
+# convention of setting fixed globals rather than subshelling out a
+# multi-field result.
+mock_lookup_agent() {
+    # mock_lookup_agent <uuid> -- looks up <uuid> in $MOCK_DIR/agents.tsv;
+    # returns 1 (no globals touched) if not found.
+    mla_target="$1"
+    [ -f "$MOCK_DIR/agents.tsv" ] || return 1
+    while IFS='	' read -r mla_u mla_short mla_name mla_status mla_arch mla_nperms || [ -n "$mla_u" ]; do
+        [ -n "$mla_u" ] || continue
+        if [ "$mla_u" = "$mla_target" ]; then
+            MOCK_ROW_UUID="$mla_u"
+            MOCK_ROW_SHORT="$mla_short"
+            MOCK_ROW_NAME="$mla_name"
+            MOCK_ROW_STATUS="$mla_status"
+            MOCK_ROW_ARCHIVED="$mla_arch"
+            MOCK_ROW_NPERMS="$mla_nperms"
+            return 0
+        fi
+    done < "$MOCK_DIR/agents.tsv"
+    return 1
+}
+
+mock_set_status() {
+    # mock_set_status <uuid> <new_status> -- rewrites agents.tsv via a
+    # temp-file + mv (atomic swap; concurrent readers see either the whole
+    # old file or the whole new one), replacing the status column for the
+    # row matching <uuid>. No-op if agents.tsv doesn't exist or <uuid>
+    # isn't found.
+    mss_uuid="$1"; mss_status="$2"
+    [ -f "$MOCK_DIR/agents.tsv" ] || return 0
+    mss_tmp="$MOCK_DIR/agents.tsv.tmp.$$"
+    : > "$mss_tmp"
+    while IFS='	' read -r mss_u mss_short mss_name mss_st mss_arch mss_nperms || [ -n "$mss_u" ]; do
+        [ -n "$mss_u" ] || continue
+        [ "$mss_u" = "$mss_uuid" ] && mss_st="$mss_status"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$mss_u" "$mss_short" "$mss_name" "$mss_st" "$mss_arch" "$mss_nperms" >> "$mss_tmp"
+    done < "$MOCK_DIR/agents.tsv"
+    mv -f "$mss_tmp" "$MOCK_DIR/agents.tsv"
+}
+
+mock_record_delivery() {
+    # mock_record_delivery <uuid> <prompt-file> -- records one successful
+    # delivery: appends "uuid<TAB>cksum<TAB>seq" to send.log and copies the
+    # prompt file verbatim to sent.d/<seq zero-padded to 3 digits>. Only
+    # called on rc=0 sends (a failed send delivers nothing).
+    mrd_uuid="$1"; mrd_file="$2"
+    mrd_seq="$(mock_next_seq "$MOCK_DIR/deliver.n")"
+    mrd_cksum="$(cksum < "$mrd_file" 2>/dev/null | cut -d' ' -f1)"
+    printf '%s\t%s\t%s\n' "$mrd_uuid" "$mrd_cksum" "$mrd_seq" >> "$MOCK_DIR/send.log"
+    mkdir -p "$MOCK_DIR/sent.d" 2>/dev/null
+    mrd_seq3="$(printf '%03d' "$mrd_seq")"
+    cp "$mrd_file" "$MOCK_DIR/sent.d/$mrd_seq3" 2>/dev/null
+}
+
+log_call() {
+    # log_call <argv...> -- appends one tab-separated line of the full
+    # original argv to calls.log (tabs, not spaces, so args containing
+    # spaces -- e.g. a message-text positional -- stay unambiguous).
+    lc_line=""
+    for lc_a in "$@"; do
+        if [ -z "$lc_line" ]; then
+            lc_line="$lc_a"
+        else
+            lc_line="$lc_line	$lc_a"
+        fi
+    done
+    printf '%s\n' "$lc_line" >> "$MOCK_DIR/calls.log"
+}
+
+# =====================================================================
+# Subcommands
+# =====================================================================
+
+mock_ls() {
+    # mock_ls -- prints every agents.tsv row as a camelCase JSON array
+    # (id/shortId/name/status/archived), matching the real
+    # `paseo ls --json` shape closely enough for resolve_agent()'s
+    # id-prefix/name matching and the dispatcher's orphan checks.
+    ml_out="["
+    ml_first=1
+    if [ -f "$MOCK_DIR/agents.tsv" ]; then
+        while IFS='	' read -r ml_uuid ml_short ml_name ml_status ml_archived ml_nperms || [ -n "$ml_uuid" ]; do
+            [ -n "$ml_uuid" ] || continue
+            ml_arch_json="false"
+            [ "$ml_archived" = "1" ] && ml_arch_json="true"
+            if [ "$ml_first" -eq 1 ]; then
+                ml_first=0
+            else
+                ml_out="$ml_out,"
+            fi
+            ml_out="$ml_out{\"id\":\"$ml_uuid\",\"shortId\":\"$ml_short\",\"name\":\"$ml_name\",\"status\":\"$ml_status\",\"archived\":$ml_arch_json}"
+        done < "$MOCK_DIR/agents.tsv"
+    fi
+    ml_out="$ml_out]"
+    printf '%s\n' "$ml_out"
+    return 0
+}
+
+mock_inspect() {
+    # mock_inspect <uuid> [--json] -- prints a PascalCase JSON object
+    # (Status/Archived/PendingPermissions) for <uuid>; PendingPermissions
+    # is a dummy array of length <nperms> from agents.tsv (only its length
+    # is ever inspected by bin/paseo-queue). Fails (rc=1, stderr message)
+    # if <uuid> isn't in agents.tsv.
+    mi_uuid="${1:-}"
+    if [ -z "$mi_uuid" ]; then
+        echo "paseo: inspect: missing agent id" >&2
+        return 1
+    fi
+    if ! mock_lookup_agent "$mi_uuid"; then
+        echo "paseo: inspect: no such agent: $mi_uuid" >&2
+        return 1
+    fi
+
+    mi_arch_json="false"
+    [ "$MOCK_ROW_ARCHIVED" = "1" ] && mi_arch_json="true"
+
+    mi_n="$MOCK_ROW_NPERMS"
+    case "$mi_n" in ''|*[!0-9]*) mi_n=0 ;; esac
+
+    mi_perms="["
+    mi_i=1
+    while [ "$mi_i" -le "$mi_n" ]; do
+        [ "$mi_i" -gt 1 ] && mi_perms="$mi_perms,"
+        mi_perms="$mi_perms\"perm-$mi_i\""
+        mi_i=$((mi_i + 1))
+    done
+    mi_perms="$mi_perms]"
+
+    printf '{"Status":"%s","Archived":%s,"PendingPermissions":%s}\n' \
+        "$MOCK_ROW_STATUS" "$mi_arch_json" "$mi_perms"
+    return 0
+}
+
+mock_wait() {
+    # mock_wait <uuid> [--timeout N] [--json] -- consumes the next
+    # wait.script line (see file-format header comment above). "after=N"
+    # sleeps N seconds first; "set_status=..." mutates agents.tsv;
+    # "result=..." becomes the printed status. Exhausted/missing script:
+    # sleep 1s and report the agent's current status unmodified.
+    mw_uuid="${1:-}"
+    shift 2>/dev/null || :
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --timeout) shift; shift 2>/dev/null || : ;;
+            --json) shift ;;
+            *) shift ;;
+        esac
+    done
+
+    if mw_line="$(mock_next_line "$MOCK_DIR/wait.script" "$MOCK_DIR/wait.n")"; then
+        mw_after="$(mock_kv "$mw_line" after)" || mw_after=""
+        mw_result="$(mock_kv "$mw_line" result)" || mw_result="idle"
+        mw_set_status="$(mock_kv "$mw_line" set_status)" || mw_set_status=""
+
+        case "$mw_after" in
+            ''|*[!0-9]*) : ;;
+            *) [ "$mw_after" -gt 0 ] && sleep "$mw_after" ;;
+        esac
+
+        [ -n "$mw_set_status" ] && mock_set_status "$mw_uuid" "$mw_set_status"
+
+        printf '{"status":"%s"}\n' "$mw_result"
+        return 0
+    fi
+
+    sleep 1
+    mw_status="unknown"
+    mock_lookup_agent "$mw_uuid" && mw_status="$MOCK_ROW_STATUS"
+    printf '{"status":"%s"}\n' "$mw_status"
+    return 0
+}
+
+mock_send() {
+    # mock_send <uuid> --prompt-file <path> -- consumes the next
+    # send.script line (see file-format header comment above): "rc=0"
+    # delivers (records send.log + sent.d); "rc=1 err=<text>" fails with
+    # <text> on stderr; "rc=1 set_status=closed" fails and flips the
+    # agent's status. Exhausted/missing script: models a real blocking
+    # `paseo send` -- flips status running->idle and succeeds.
+    ms_uuid="${1:-}"
+    shift 2>/dev/null || :
+    ms_promptfile=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --prompt-file) shift; ms_promptfile="${1:-}"; shift 2>/dev/null || : ;;
+            *) shift ;;
+        esac
+    done
+
+    if [ -z "$ms_uuid" ]; then
+        echo "paseo: send: missing agent id" >&2
+        return 1
+    fi
+    if [ -z "$ms_promptfile" ] || [ ! -r "$ms_promptfile" ]; then
+        echo "paseo: send: missing or unreadable --prompt-file" >&2
+        return 1
+    fi
+
+    if ms_line="$(mock_next_line "$MOCK_DIR/send.script" "$MOCK_DIR/send.n")"; then
+        ms_rc="$(mock_kv "$ms_line" rc)" || ms_rc=0
+        ms_err="$(mock_kv "$ms_line" err)" || ms_err=""
+        ms_set_status="$(mock_kv "$ms_line" set_status)" || ms_set_status=""
+
+        if [ "$ms_rc" = "0" ]; then
+            mock_record_delivery "$ms_uuid" "$ms_promptfile"
+            return 0
+        fi
+
+        [ -n "$ms_set_status" ] && mock_set_status "$ms_uuid" "$ms_set_status"
+        [ -n "$ms_err" ] && echo "$ms_err" >&2
+        case "$ms_rc" in ''|*[!0-9]*) ms_rc=1 ;; esac
+        return "$ms_rc"
+    fi
+
+    # Exhausted/missing script: real `paseo send` blocks until the turn
+    # completes, so simulate the agent transiting running -> idle then
+    # succeeding.
+    mock_set_status "$ms_uuid" running
+    mock_set_status "$ms_uuid" idle
+    mock_record_delivery "$ms_uuid" "$ms_promptfile"
+    return 0
+}
+
+# =====================================================================
+# Main
+# =====================================================================
+
+log_call "$@"
+
+if [ -e "$MOCK_DIR/down" ]; then
+    echo "paseo: connection refused" >&2
+    exit 7
+fi
+
+mock_cmd="${1:-}"
+[ "$#" -gt 0 ] && shift
+
+case "$mock_cmd" in
+    ls)
+        mock_ls "$@"
+        exit $?
+        ;;
+    inspect)
+        mock_inspect "$@"
+        exit $?
+        ;;
+    wait)
+        mock_wait "$@"
+        exit $?
+        ;;
+    send)
+        mock_send "$@"
+        exit $?
+        ;;
+    *)
+        echo "paseo: mock: unknown or unsupported subcommand: $mock_cmd" >&2
+        exit 1
+        ;;
+esac
