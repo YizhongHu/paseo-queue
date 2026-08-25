@@ -1,0 +1,67 @@
+#!/bin/sh
+# paseo-queue: local FIFO enqueue-for-busy-agents CLI + per-agent dispatcher.
+#
+# Disposable stopgap until getpaseo/paseo#3797 (daemon-owned queue feature)
+# ships upstream. See README.md for design details and AGENTS.md for
+# contributor rules (POSIX sh only; no jq/flock/setsid; target macOS
+# /bin/sh = bash 3.2 in sh mode).
+set -u
+
+# --- Environment knobs (all test-overridable) --------------------------
+: "${PQ_HOME:=$HOME/.paseo-queue}"
+: "${PQ_LINGER:=10}"
+: "${PQ_WAIT_TIMEOUT:=60}"
+: "${PQ_MAX_BYTES:=262144}"
+: "${PQ_SEND_RETRIES:=5}"
+: "${PQ_DAEMON_RETRIES:=15}"
+: "${PQ_HOLD_LOG_EVERY:=300}"
+
+LC_ALL=C
+export LC_ALL
+umask 077
+
+# --- Usage ---------------------------------------------------------------
+usage() {
+    cat <<'EOF'
+Usage: paseo-queue <subcommand> [args]
+
+Subcommands:
+  add <agent> [text|--file f|stdin]   Enqueue a message for delivery to <agent>
+  ls                                   List queued agents and pending message counts
+  rm <agent> <msg|--all>               Remove a pending message (or all) for <agent>
+  status                               Show dispatcher/queue health across agents
+  drain <agent>                        Force-start the dispatcher for <agent>
+  stop <agent>                         Stop the dispatcher for <agent>
+  log <agent> [-n N] [-f]              Show (or follow) the dispatch log for <agent>
+  help                                 Show this help message
+EOF
+}
+
+# --- Main dispatch ---------------------------------------------------------
+main() {
+    cmd="${1:-}"
+    [ "$#" -gt 0 ] && shift
+
+    case "$cmd" in
+        help|--help|-h)
+            usage
+            exit 0
+            ;;
+        add|ls|rm|status|drain|stop|log)
+            echo "paseo-queue: $cmd: not implemented" >&2
+            exit 1
+            ;;
+        _dispatch)
+            # Hidden per-agent dispatcher entry point (see plan Design
+            # section: spawn-race protocol). Stub until step 3.
+            echo "paseo-queue: _dispatch: not implemented" >&2
+            exit 1
+            ;;
+        *)
+            usage >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
