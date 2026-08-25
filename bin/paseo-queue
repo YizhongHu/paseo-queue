@@ -8,14 +8,16 @@
 set -u
 
 # --- Environment knobs (all test-overridable) --------------------------
-: "${PQ_HOME:=$HOME/.paseo-queue}"
-: "${PQ_LINGER:=10}"
-: "${PQ_WAIT_TIMEOUT:=60}"
-: "${PQ_MAX_BYTES:=262144}"
-: "${PQ_SEND_RETRIES:=5}"
-: "${PQ_DAEMON_RETRIES:=15}"
-: "${PQ_HOLD_LOG_EVERY:=300}"
-: "${PQ_NO_SPAWN:=0}"
+# External override names are PASEO_QUEUE_* per the design plan; internal
+# code throughout this script reads the short PQ_* form assigned here.
+PQ_HOME="${PASEO_QUEUE_HOME:-$HOME/.paseo-queue}"
+PQ_LINGER="${PASEO_QUEUE_LINGER:-10}"
+PQ_WAIT_TIMEOUT="${PASEO_QUEUE_WAIT_TIMEOUT:-60}"
+PQ_MAX_BYTES="${PASEO_QUEUE_MAX_BYTES:-262144}"
+PQ_SEND_RETRIES="${PASEO_QUEUE_SEND_RETRIES:-5}"
+PQ_DAEMON_RETRIES="${PASEO_QUEUE_DAEMON_RETRIES:-15}"
+PQ_HOLD_LOG_EVERY="${PASEO_QUEUE_HOLD_LOG_EVERY:-300}"
+PQ_NO_SPAWN="${PASEO_QUEUE_NO_SPAWN:-0}"
 
 LC_ALL=C
 export LC_ALL
@@ -163,20 +165,20 @@ single `paseo ls --json` snapshot, by unique agent-id prefix (this subsumes
 the 7-char shortId and the full 36-char UUID) or by an EXACT agent name
 (never a name prefix, since names may contain spaces). An ambiguous query
 exits 2, listing every candidate on stderr. rm/ls/log/stop/status also
-accept a full 36-char UUID that matches an existing $PQ_HOME state
+accept a full 36-char UUID that matches an existing $PASEO_QUEUE_HOME state
 directory even when the agent no longer appears in `paseo ls` (the "orphan"
 escape hatch) -- this never applies to add/drain, which require a live
 agent.
 
 Environment knobs (all test-overridable):
-  PQ_HOME              State root (default: $HOME/.paseo-queue)
-  PQ_LINGER            Dispatcher idle linger, seconds (default: 10)
-  PQ_WAIT_TIMEOUT      Dispatcher `paseo wait` timeout, seconds (default: 60)
-  PQ_MAX_BYTES         Max enqueued message size in bytes (default: 262144)
-  PQ_SEND_RETRIES      Transient send-failure retry count (default: 5)
-  PQ_DAEMON_RETRIES    Transient daemon-unreachable retry count (default: 15)
-  PQ_HOLD_LOG_EVERY    Rate limit for HOLD-PERM log lines, seconds (default: 300)
-  PQ_NO_SPAWN          Set to 1 to disable dispatcher auto-spawn (tests only)
+  PASEO_QUEUE_HOME              State root (default: $HOME/.paseo-queue)
+  PASEO_QUEUE_LINGER            Dispatcher idle linger, seconds (default: 10)
+  PASEO_QUEUE_WAIT_TIMEOUT      Dispatcher `paseo wait` timeout, seconds (default: 60)
+  PASEO_QUEUE_MAX_BYTES         Max enqueued message size in bytes (default: 262144)
+  PASEO_QUEUE_SEND_RETRIES      Transient send-failure retry count (default: 5)
+  PASEO_QUEUE_DAEMON_RETRIES    Transient daemon-unreachable retry count (default: 15)
+  PASEO_QUEUE_HOLD_LOG_EVERY    Rate limit for HOLD-PERM log lines, seconds (default: 300)
+  PASEO_QUEUE_NO_SPAWN          Set to 1 to disable dispatcher auto-spawn (tests only)
 
 Exit codes:
   0  ok
@@ -493,8 +495,8 @@ spawn_dispatcher() {
     # competes for the per-agent lock and exits immediately (logging SKIP)
     # if a live holder already exists, so it is always safe to call this
     # without checking first (closes the enqueue-vs-exiting-dispatcher
-    # race). PQ_NO_SPAWN=1 disables the fork entirely, for test harnesses
-    # that drive `_dispatch` manually.
+    # race). PASEO_QUEUE_NO_SPAWN=1 (internally PQ_NO_SPAWN) disables the
+    # fork entirely, for test harnesses that drive `_dispatch` manually.
     sd_uuid="$1"
     if [ "$PQ_NO_SPAWN" = "1" ]; then
         return 0
@@ -669,7 +671,7 @@ cmd_add() {
     ca_bytes="$(pq_file_size "$ca_stage")"
     if [ -n "$ca_bytes" ] && [ "$ca_bytes" -gt "$PQ_MAX_BYTES" ]; then
         rm -f "$ca_stage"
-        die 1 "add: message exceeds PQ_MAX_BYTES ($PQ_MAX_BYTES bytes); override via PQ_MAX_BYTES"
+        die 1 "add: message exceeds PASEO_QUEUE_MAX_BYTES ($PQ_MAX_BYTES bytes); override via PASEO_QUEUE_MAX_BYTES"
     fi
 
     ca_msgname="$(next_msg_name "$ca_dir")"
