@@ -91,8 +91,9 @@ paseo-queue <subcommand> [args]
   stdin (mutually exclusive; if none is given and stdin is a tty, this is
   an error). Flags and `[text]` may appear in any order/interspersed; a
   second stray positional argument is an error (quote a multi-word message
-  into one argument). Use `--` to force a literal `[text]` that starts with
-  a dash.
+  into one argument). Dash-leading text is accepted inline when it contains
+  whitespace (including markdown bullets); use `--` only for a whitespace-free
+  token such as `-v`.
 
 - **`ls`**
   List every known agent's queue: pending/sent/failed counts and the
