@@ -648,6 +648,13 @@ cmd_add() {
             --)
                 ca_saw_dashdash=1
                 ;;
+            *[[:space:]]*)
+                # No real option in this tool contains whitespace, so a
+                # whitespace-bearing token is message text by construction.
+                # Keep this predicate narrow: punctuation-bearing option
+                # typos must still reach the unknown-option guard.
+                set -- "$@" "$ca_cur"
+                ;;
             -*)
                 die 1 "add: unknown option: $ca_cur"
                 ;;
