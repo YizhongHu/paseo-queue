@@ -30,8 +30,10 @@ paseo send <agent-id> "<message>"
 paseo send <agent-id> --prompt-file /path/to/message.txt
 ```
 
-`<agent-id>` may be a full ID or an accepted prefix. Prefer the file form for
-multi-line messages.
+`<agent-id>` may be a full ID or an accepted prefix. Multi-line text, including
+markdown bullets, is accepted inline as a single quoted argument. Prefer the file
+form when the message is long or when its quoting is awkward to get right in a
+shell, not because of its shape.
 
 ## Message shape
 
