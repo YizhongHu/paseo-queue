@@ -656,7 +656,7 @@ cmd_add() {
                 set -- "$@" "$ca_cur"
                 ;;
             -*)
-                die 1 "add: unknown option: $ca_cur"
+                die 1 "add: unknown option: $ca_cur (if this is your message text, pass it after --)"
                 ;;
             *)
                 set -- "$@" "$ca_cur"

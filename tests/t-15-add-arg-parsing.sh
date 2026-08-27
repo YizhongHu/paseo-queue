@@ -75,8 +75,11 @@ t15_case_c() (
 
 t15_case_d() (
     for t15_opt in --waitt --wait-timeout=5 --wait_timeout; do
-        PASEO_QUEUE_NO_SPAWN=1 "$PQT_BIN" add "$AGENT_D" "$t15_opt" >/dev/null 2>&1
-        assert_rc 1 "$?" "genuine unknown option $t15_opt should be rejected"
+        t15_out="$(PASEO_QUEUE_NO_SPAWN=1 "$PQT_BIN" add "$AGENT_D" "$t15_opt" 2>&1)"
+        t15_rc=$?
+        assert_rc 1 "$t15_rc" "genuine unknown option $t15_opt should be rejected"
+        printf '%s\n' "$t15_out" | grep -q "if this is your message text, pass it after --" \
+            || fail "unknown option $t15_opt should suggest the -- escape"
     done
     t15_pending=0
     for t15_f in "$PASEO_QUEUE_HOME/$AGENT_D"/pending/*.msg; do
