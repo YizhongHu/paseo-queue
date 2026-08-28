@@ -237,7 +237,8 @@ flags the two conditions below with a stderr `WARN` line.
   documented, not a bug.
 - **Stale-lock detection has a narrow pid-reuse residual risk.** Lock
   liveness is checked via `kill -0` plus a `ps -p <pid> -o command=`
-  substring match on `paseo-queue` (no `flock` on macOS). If a dispatcher
+  substring match on `paseo-queue` (no `flock` on macOS; the check is
+  deliberately conservative). If a dispatcher
   dies uncleanly and the OS later reuses that exact pid for an unrelated
   `paseo-queue` process before the stale lock is broken, the lock can
   appear live for longer than it should. The only consequence is a delayed
