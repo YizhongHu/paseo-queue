@@ -16,20 +16,29 @@ set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_DIR=${REPO_DIR:-"$script_dir"}
 
-# 1. Ensure the CLI is executable.
+# 1. Verify the runtime the CLI needs. bin/paseo-queue is a Python 3
+# program, so a missing python3 would produce a confusing exec failure at
+# first use rather than here.
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "install.sh: FAILED - python3 is not on PATH." >&2
+    echo "paseo-queue is a Python 3 program and needs python3 available." >&2
+    exit 1
+fi
+
+# 2. Ensure the CLI is executable.
 chmod +x "$REPO_DIR/bin/paseo-queue"
 
-# 2. Symlink the CLI onto PATH via ~/.local/bin.
+# 3. Symlink the CLI onto PATH via ~/.local/bin.
 mkdir -p "$HOME/.local/bin"
 ln -sf "$REPO_DIR/bin/paseo-queue" "$HOME/.local/bin/paseo-queue"
 
-# 3. Install the skill into every skill directory Paseo-managed agents read.
+# 4. Install the skill into every skill directory Paseo-managed agents read.
 for skills_root in "$HOME/.claude/skills" "$HOME/.codex/skills" "$HOME/.agents/skills"; do
     mkdir -p "$skills_root/paseo-queue"
     cp -f "$REPO_DIR/skills/paseo-queue/SKILL.md" "$skills_root/paseo-queue/SKILL.md"
 done
 
-# 4. Verify: the CLI must resolve on PATH and run.
+# 5. Verify: the CLI must resolve on PATH and run.
 if ! command -v paseo-queue >/dev/null 2>&1; then
     echo "install.sh: FAILED - paseo-queue is not on PATH." >&2
     echo "Remedy: add \$HOME/.local/bin to PATH, e.g.:" >&2

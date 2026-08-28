@@ -1,27 +1,36 @@
 # Contributor rules for paseo-queue
 
-- **POSIX sh only.** Target macOS `/bin/sh`, which is bash 3.2 running in
-  `sh` mode. Do not use bashisms (arrays, `[[ ]]`, `local`, process
-  substitution, etc.).
-- **No `jq`.** Not guaranteed to be installed; use `python3` one-liners for
-  JSON parsing/generation instead (see below).
-- **No `flock`.** Not available on macOS. Locking is implemented with
-  `mkdir` + pid-file liveness checks (see the design plan for the exact
-  protocol).
-- **No `setsid`.** Not available on macOS.
-- **No `date +%s%N`.** Nanosecond epoch formatting is broken on macOS
-  `date`; stick to whole-second epoch (`date +%s`) plus pid/sequence
-  numbers for uniqueness.
-- **`python3` is allowed, but only for JSON one-liners.** The target
-  environment's `python3` is 3.8.3 — do not rely on newer stdlib features.
-  Do not write substantial logic in Python; it exists only to bridge JSON
-  in/out of shell.
+- **Python 3 stdlib only.** `bin/paseo-queue` is a single-file Python 3
+  program. No third-party packages, no `requirements.txt`, no venv: the tool
+  must run from a bare `python3` on `PATH`.
+- **Target Python 3.8.** The reference environment reports
+  `Python 3.8.3`. Do not use 3.9+ syntax or APIs — no `dict | dict` merge
+  operator, no `match` statements, no builtin generics in annotations
+  (`list[str]`), no `str.removeprefix`/`removesuffix`.
+- **The on-disk layout is a compatibility surface, not an implementation
+  detail.** `$PASEO_QUEUE_HOME/<uuid>/{pending,sent,failed,tmp}/` plus
+  `state`, `agent.name`, `dispatch.log` and `lock/pid` are read and written
+  by other versions of this tool, including the shell implementation this
+  one replaced. Changing the layout breaks rollback. Don't.
+- **No `flock`.** Not available on macOS. Locking is `mkdir` plus pid-file
+  liveness checks; see the dispatcher section of README.md for the protocol.
+- **The dispatcher must be its own session leader.** Spawn it with
+  `start_new_session=True`. Inheriting the caller's process group is what
+  caused issue #4: short-lived agent shells took their dispatchers down with
+  them and stranded messages silently for ~21 hours.
+- **Install signal handlers before acquiring the lock.** A signal arriving
+  between `acquire_lock` and the `START` log line otherwise strands `lock/`
+  holding a dead pid with no log line. The path that fails to acquire the
+  lock must restore the original handlers before exiting, or it will clobber
+  the state file of the live dispatcher that legitimately holds the lock.
+- **Whole-second epoch in message filenames.** Filenames are
+  `<epoch10>-<pid7>-<seq4>.msg` and their `LC_ALL=C` glob order is what
+  makes delivery FIFO. Keep the fixed widths.
 - **Env knobs are named `PASEO_QUEUE_*` externally, `PQ_*` internally.**
   Every user/test-facing override is `PASEO_QUEUE_HOME`,
   `PASEO_QUEUE_LINGER`, etc. (see README.md for the full table);
   `bin/paseo-queue` reads each of those once at startup into an internal
-  `PQ_*` variable (`PQ_HOME`, `PQ_LINGER`, ...) that the rest of the script
-  uses. Keep this split when adding a new knob: add the `PASEO_QUEUE_*`
+  module-level constant that the rest of the program uses. Keep this split when adding a new knob: add the `PASEO_QUEUE_*`
   read-with-default at the top of the file, use only the `PQ_*` name
   everywhere else, and document the new `PASEO_QUEUE_*` name in both
   `usage()` and README.md.
