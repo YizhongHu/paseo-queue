@@ -34,8 +34,13 @@ take precedence over ordinary queued coordination.
   prints every filename it removes. Read that output before moving on:
   `--all` can take undelivered messages you did not know were queued.
 - `paseo-queue log <agent>` — show the dispatch log.
-- `paseo-queue drain <agent>` — force-(re)start the dispatcher.
-- `paseo-queue stop <agent>` — SIGTERM the live dispatcher (queue untouched).
+- `paseo-queue drain <agent>` — force-(re)start the dispatcher; reports
+  whether it spawned one or one was already live. This is the remedy
+  `status` names when it warns about pending messages with no dispatcher.
+- `paseo-queue stop <agent>` — SIGTERM the live dispatcher, naming the pid
+  it killed. Idempotent: exits 0 whether or not one was running, so it is
+  safe as an ensure-stopped step. Read the receipt, not the exit code, to
+  tell "terminated something" from "already stopped". Queue untouched.
 
 ## Agent argument
 
