@@ -26,10 +26,14 @@ Subcommands:
       Remove pending messages.
   status
       Show local dispatcher and queue status.
-  drain <agent>
-      Start delivery for an agent.
-  stop <agent>
-      Stop delivery for an agent.
+  drain <agent> [--quiet]
+      Start delivery for an agent, printing whether a dispatcher was spawned
+      or one was already live. Safe to call repeatedly.
+  stop <agent> [--quiet]
+      SIGTERM the live dispatcher, naming the pid it terminated. Idempotent:
+      exits 0 whether or not one was running, so it composes as an
+      ensure-stopped step. The receipt distinguishes the two cases. The queue
+      itself is left untouched.
   log <agent> [-n N] [-f]
       Show the dispatch log for an agent.
 """
@@ -975,22 +979,73 @@ def cmd_status(args):
     return 0
 
 
+def split_quiet(args):
+    """Pull a --quiet flag out of argv, returning (remaining, quiet)."""
+    remaining = []
+    quiet = False
+    for token in args:
+        if token == "--quiet":
+            quiet = True
+        else:
+            remaining.append(token)
+    return remaining, quiet
+
+
+def lock_holder_pid(agent_dir):
+    """The pid recorded in lock/pid, as a string, or "" if unreadable."""
+    try:
+        with open(os.path.join(agent_dir, "lock", "pid"), "r") as stream:
+            return stream.read().strip()
+    except (IOError, OSError):
+        return ""
+
+
 def cmd_drain(args):
+    args, quiet = split_quiet(args)
     if not args:
-        return die("drain: usage: paseo-queue drain <agent>")
+        return die("drain: usage: paseo-queue drain <agent> [--quiet]")
+    if len(args) > 1:
+        return die("drain: unknown option: %s" % args[1])
     resolved = resolve_agent(args[0], allow_orphan=False)
     if resolved is None:
         return LAST_RESOLVE_RC
     uuid, unused_name = resolved
     agent_dir = os.path.join(queue_home(), uuid)
     ensure_agent_dirs(agent_dir)
+
+    # Observe BEFORE spawning so the receipt can say which of the two things
+    # happened. The spawn itself stays UNCONDITIONAL: it is what closes the
+    # enqueue-versus-exiting-dispatcher race, and a redundant dispatcher exits
+    # immediately logging SKIP. So this observation is a report, never a
+    # decision -- do not turn it into an early return.
+    already = lock_holder_alive(agent_dir)
+    holder = lock_holder_pid(agent_dir) if already else ""
+
     spawn_dispatcher(uuid)
+
+    # `status` tells callers to run drain when it warns about pending messages
+    # with no live dispatcher. Following that advice used to print nothing at
+    # all, so the caller could not distinguish the remedy working from a no-op
+    # or from a failure to resolve (issue #10).
+    if not quiet:
+        if already and holder:
+            sys.stdout.write("paseo-queue: drained %s (dispatcher already "
+                             "live, pid=%s)\n" % (uuid[:7], holder))
+        elif already:
+            sys.stdout.write("paseo-queue: drained %s (dispatcher already "
+                             "live)\n" % uuid[:7])
+        else:
+            sys.stdout.write("paseo-queue: drained %s (spawned a "
+                             "dispatcher)\n" % uuid[:7])
     return 0
 
 
 def cmd_stop(args):
+    args, quiet = split_quiet(args)
     if not args:
-        return die("stop: usage: paseo-queue stop <agent>")
+        return die("stop: usage: paseo-queue stop <agent> [--quiet]")
+    if len(args) > 1:
+        return die("stop: unknown option: %s" % args[1])
     resolved = resolve_agent(args[0], allow_orphan=True)
     if resolved is None:
         return LAST_RESOLVE_RC
@@ -1008,10 +1063,25 @@ def cmd_stop(args):
             pass
         else:
             log_line(agent_dir, "STOP", "%s pid=%s" % (uuid, pid))
+            # The consequential branch: a live process was just terminated.
+            # It used to be the SILENT one, while the harmless no-op below was
+            # loud and non-zero -- exactly backwards (issue #10).
+            if not quiet:
+                sys.stdout.write("paseo-queue: stopped %s dispatcher pid=%s\n"
+                                 % (uuid[:7], pid))
             return 0
-    sys.stderr.write("paseo-queue: stop: no live dispatcher for %s\n" %
-                     args[0])
-    return 1
+
+    # Nothing was running. This is SUCCESS, not failure: the caller asked for
+    # the dispatcher to be stopped and it is stopped. Exiting non-zero here
+    # made `stop X && next` fail precisely when X was already in the desired
+    # state, so stop could not be used as an ensure-stopped step. Callers that
+    # need to distinguish "terminated something" from "already stopped" read
+    # the receipt on stdout, which says which happened -- more explicitly than
+    # an exit code could.
+    if not quiet:
+        sys.stdout.write("paseo-queue: stopped %s (no live dispatcher; "
+                         "already stopped)\n" % uuid[:7])
+    return 0
 
 
 def cmd_ls(args):

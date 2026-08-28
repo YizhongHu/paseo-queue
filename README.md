@@ -122,12 +122,12 @@ paseo-queue <subcommand> [args]
   when its state is `holding-permission`. Exits 3 if `paseo ls --json`
   itself fails (daemon unreachable).
 
-- **`drain <agent>`**
+- **`drain <agent> [--quiet]`**
   Force-(re)start the dispatcher for `<agent>` (ensures its state
   directories exist, then spawns the dispatcher; safe to call whether or
   not one is already running).
 
-- **`stop <agent>`**
+- **`stop <agent> [--quiet]`**
   Send SIGTERM to the live dispatcher for `<agent>`. The queue itself
   (pending/sent/failed) is left untouched.
 
