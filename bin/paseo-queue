@@ -861,8 +861,26 @@ cmd_rm() {
         fi
         printf 'paseo-queue: removed %s pending message(s) for %s\n' "$cr_removed" "$cr_short"
         log_line "$cr_dir" CANCEL "$cr_uuid" "--all ($cr_removed removed)"
-        if pq_dir_is_empty "$cr_dir" && ! pq_agent_known "$cr_uuid"; then
-            rm -rf "$cr_dir"
+        # Orphan escape hatch. The agent check comes FIRST so the stale-lock
+        # reclaim below can only ever touch a queue whose agent is already
+        # gone: nothing can legitimately be starting a dispatcher for an
+        # unresolvable agent (both add and drain resolve first), so there is
+        # no live dispatcher to race with. pq_agent_known treats an
+        # unreachable daemon as "known", so a daemon outage never triggers
+        # any of this.
+        if ! pq_agent_known "$cr_uuid"; then
+            # A lock whose recorded holder is dead must not keep an orphaned
+            # queue alive forever. Stale locks are otherwise only reclaimed
+            # inside a STARTING dispatcher, and no dispatcher can start for
+            # an orphan, so (orphaned agent + stale lock) used to be a
+            # permanent dead end: `drain` exits 2 unable to resolve the
+            # agent, `rm --all` could not delete the directory because
+            # pq_dir_is_empty() counts any lock/ as non-empty, and `status`
+            # went on reporting state=running for a pid dead for hours.
+            dp_lock_is_stale "$cr_dir" && break_stale_lock "$cr_dir"
+            if pq_dir_is_empty "$cr_dir"; then
+                rm -rf "$cr_dir"
+            fi
         fi
         exit 0
     fi
