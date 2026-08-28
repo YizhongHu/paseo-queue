@@ -85,7 +85,7 @@ paseo-queue <subcommand> [args]
 
 ### Subcommands
 
-- **`add <agent> [text|--file <path>|stdin] [--wait] [--wait-timeout <seconds>] [--quiet]`**
+- **`add <agent> [text|--file <path>|stdin] [--wait] [--wait-timeout <seconds>] [--quiet] [--interrupt]`**
   Enqueue a message for delivery to `<agent>`. Message content comes from
   exactly one source: a single `[text]` argument, `--file <path>`, or piped
   stdin (mutually exclusive; if none is given and stdin is a tty, this is
@@ -101,6 +101,16 @@ paseo-queue <subcommand> [args]
   ```
   Exit `0` there means *enqueued*, not delivered; `--wait` adds a second
   line reporting delivery. `--quiet` suppresses both (errors still print).
+
+  `--interrupt` delivers that message immediately — skipping both the wait for
+  the agent to become idle and the pending-permission hold — and files it in
+  `sent/`. Prefer it over a bare `paseo send` for anything you would otherwise
+  queue: the queue performs the send itself, so the message is recorded once
+  and no dispatcher can deliver it again. A direct `paseo send` is invisible to
+  the queue, so a message that was also queued arrives twice. `--interrupt`
+  jumps any backlog, which is why its receipt reads `interrupted` rather than
+  `delivered`; a failed immediate send leaves the message queued and exits
+  nonzero.
 
 - **`ls`**
   List every known agent's queue: pending/sent/failed counts and the
@@ -198,6 +208,7 @@ value below unless overridden.
 | `PASEO_QUEUE_LINGER`             | `10`                 | Dispatcher idle linger, seconds, before it exits an empty queue. |
 | `PASEO_QUEUE_WAIT_TIMEOUT`       | `60`                 | Timeout passed to the dispatcher's internal `paseo wait` call. |
 | `PASEO_QUEUE_MAX_BYTES`          | `262144`             | Max enqueued message size in bytes. |
+| `PASEO_QUEUE_INTERRUPT_GRACE`    | `10`                 | Seconds `add --interrupt` waits for an in-flight dispatcher send before proceeding anyway. |
 | `PASEO_QUEUE_SEND_RETRIES`       | `5`                  | Transient send-failure retry count before a message is moved to `failed/`. |
 | `PASEO_QUEUE_DAEMON_RETRIES`     | `15`                 | Transient daemon-unreachable retry count before the dispatcher halts as `stalled-daemon`. |
 | `PASEO_QUEUE_HOLD_LOG_EVERY`     | `300`                | Rate limit (seconds) for repeated `HOLD-PERM` log lines. |
