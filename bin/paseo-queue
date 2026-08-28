@@ -18,24 +18,108 @@ USAGE = """Usage: paseo-queue <subcommand> [args]
 
 Subcommands:
   add <agent> [text|--file <path>|stdin] [--wait] [--wait-timeout <seconds>]
-      [--quiet]
-      Enqueue one message in local state.
+      [--quiet] [--interrupt]
+      Enqueue a message for delivery to <agent>. Message content comes from
+      exactly one source: a single [text] argument, --file <path>, or piped
+      stdin (mutually exclusive; with none given and stdin is a tty, this
+      is an error). Flags and [text] may appear in any order/interspersed;
+      a second stray positional argument is an error (quote a multi-word
+      message into one argument). Dash-leading text is accepted inline when
+      it contains whitespace (including markdown bullets); use -- only for
+      a whitespace-free token such as -v.
+      Default: returns 0 immediately after the message is enqueued and the
+      dispatcher is (re)spawned (fire-and-forget), printing one receipt line
+      naming the queued file:
+        paseo-queue: enqueued 2d4c857 pending/1787883101-0099103-0000.msg
+      Exit 0 there means ENQUEUED, not delivered; with --wait a second line
+      reports delivery. --quiet suppresses both lines (errors still print).
+      --wait: block until the message leaves pending/: exit 0 once it is
+      in sent/; exit 1 once it is in failed/ or the dispatcher state becomes
+      halted-closed, halted-failed, or stalled-daemon (message stays
+      queued); exit 4 if --wait-timeout elapses first (message stays
+      queued). --wait-timeout implies --wait.
+      --interrupt: deliver THIS message immediately, bypassing both the wait
+      for the agent to become idle and the pending-permission hold, then file
+      it in sent/. Prefer it over a bare `paseo send` for anything you would
+      otherwise queue: the queue performs the send itself, so the message is
+      recorded and no dispatcher can ever deliver it a second time. It also
+      jumps any queued backlog, which is why its receipt reads "interrupted"
+      rather than "delivered". If the immediate send fails the message stays
+      queued for normal delivery and the exit status is nonzero. Cannot be
+      combined with --wait, which would have nothing left to wait for.
+
   ls
-      List every known agent's local queue and pending filenames.
+      List every known agent's queue: pending/sent/failed counts and the
+      pending message filenames.
+
   rm <agent> <msg|--all>
-      Remove pending messages.
+      Delete one pending message (by filename) or all pending messages for
+      <agent>. Every removed filename is printed, plus a count for --all, so
+      a destructive default is never silent.
+      After --all, if the agent's state directory is then fully
+      empty (no pending/sent/failed/tmp files, no lock) and the agent is
+      orphaned (absent from `paseo ls`), the directory itself is removed.
+
   status
-      Show local dispatcher and queue status.
+      Show, per agent: state (from the dispatcher-owned state file),
+      pending/sent/failed counts, and dispatcher pid + liveness. Agents
+      absent from the current `paseo ls` snapshot are marked ORPHANED.
+      Emits stderr WARN lines when an agent has pending messages but no
+      live dispatcher, or when its state is holding-permission. Exits 3 if
+      `paseo ls --json` itself fails (daemon unreachable).
+
   drain <agent> [--quiet]
-      Start delivery for an agent, printing whether a dispatcher was spawned
-      or one was already live. Safe to call repeatedly.
+      Force-(re)start the dispatcher for <agent> (ensures its state
+      directories exist, then spawns the dispatcher; safe to call whether or
+      not one is already running). Reports whether it spawned a dispatcher or
+      found one already live, naming that pid. This is the remedy `status`
+      names when it warns about pending messages with no live dispatcher.
+
   stop <agent> [--quiet]
-      SIGTERM the live dispatcher, naming the pid it terminated. Idempotent:
-      exits 0 whether or not one was running, so it composes as an
-      ensure-stopped step. The receipt distinguishes the two cases. The queue
-      itself is left untouched.
+      SIGTERM the live dispatcher for <agent>, naming the pid it terminated.
+      The queue itself (pending/sent/failed) is left untouched. Idempotent:
+      exits 0 whether or not a dispatcher was running, so it composes as an
+      ensure-stopped step. The two receipts differ, so read the receipt rather
+      than the exit status to tell "terminated something" from "already
+      stopped".
+
   log <agent> [-n N] [-f]
-      Show the dispatch log for an agent.
+      Show the last N lines (default 20) of the dispatch log for <agent>,
+      or follow it live with -f.
+
+  help | --help | -h
+      Show this help message.
+
+Agent resolution (add/ls/rm/status/log/stop/drain): a query resolves via a
+single `paseo ls --json` snapshot, by unique agent-id prefix (this subsumes
+the 7-char shortId and the full 36-char UUID) or by an EXACT agent name
+(never a name prefix, since names may contain spaces). An ambiguous query
+exits 2, listing every candidate on stderr. rm/ls/log/stop/status also
+accept a full 36-char UUID that matches an existing $PASEO_QUEUE_HOME state
+directory even when the agent no longer appears in `paseo ls` (the "orphan"
+escape hatch) -- this never applies to add/drain, which require a live
+agent.
+
+Environment knobs (all test-overridable):
+  PASEO_QUEUE_HOME              State root (default: $HOME/.paseo-queue)
+  PASEO_QUEUE_LINGER            Dispatcher idle linger, seconds (default: 10)
+  PASEO_QUEUE_WAIT_TIMEOUT      Dispatcher `paseo wait` timeout, seconds (default: 60)
+  PASEO_QUEUE_MAX_BYTES         Max enqueued message size in bytes (default: 262144)
+  PASEO_QUEUE_SEND_RETRIES      Transient send-failure retry count (default: 5)
+  PASEO_QUEUE_DAEMON_RETRIES    Transient daemon-unreachable retry count (default: 15)
+  PASEO_QUEUE_HOLD_LOG_EVERY    Rate limit for HOLD-PERM log lines, seconds (default: 300)
+  PASEO_QUEUE_NO_SPAWN          Set to 1 to disable dispatcher auto-spawn (tests only)
+  PASEO_QUEUE_BACKOFF_SCALE     Multiplier for _dispatch backoff sleeps, nonnegative
+                                integer (default: 1; tests only)
+  PASEO_QUEUE_INTERRUPT_GRACE   Seconds add --interrupt waits for an in-flight
+                                dispatcher send before proceeding (default: 10)
+
+Exit codes:
+  0  ok
+  1  error (validation failure, missing dispatcher, no message, etc.)
+  2  agent resolution failure (not found or ambiguous)
+  3  daemon unreachable (`paseo ls`/`paseo inspect` failed)
+  4  add --wait-timeout elapsed (message remains queued)
 """
 
 EXIT_USAGE = 1
@@ -473,6 +557,7 @@ def parse_add(args):
     wait = False
     timeout = None
     quiet = False
+    interrupt = False
     positional = []
     index = 0
     literal = False
@@ -493,6 +578,8 @@ def parse_add(args):
             wait = True
         elif token == "--quiet":
             quiet = True
+        elif token == "--interrupt":
+            interrupt = True
         elif token == "--wait-timeout":
             if index >= len(tokens):
                 return None, die("add: --wait-timeout requires a value in seconds")
@@ -513,11 +600,113 @@ def parse_add(args):
         text = positional[0]
     if text is not None and file_path is not None:
         return None, die("add: message sources are mutually exclusive (text, --file, stdin)")
+    # --interrupt delivers before returning, so there is nothing left for
+    # --wait to wait for. Accepting both would let a caller believe the wait
+    # meant something.
+    if interrupt and wait:
+        return None, die("add: --interrupt already delivers before returning; --wait/--wait-timeout is redundant")
     if text is None and file_path is None:
         if sys.stdin.isatty():
             return None, die("add: no message given (pass text, --file <path>, or pipe stdin)")
-        return (agent_query, text, file_path, wait, timeout, quiet, True), 0
-    return (agent_query, text, file_path, wait, timeout, quiet, False), 0
+        return (agent_query, text, file_path, wait, timeout, quiet, True, interrupt), 0
+    return (agent_query, text, file_path, wait, timeout, quiet, False, interrupt), 0
+
+
+def read_state(agent_dir):
+    try:
+        with open(os.path.join(agent_dir, "state"), "r") as stream:
+            return stream.read().strip()
+    except (IOError, OSError):
+        return ""
+
+
+def deliver_interrupt(agent_dir, uuid, filename, quiet, short_id):
+    """Deliver one message NOW, bypassing the idle/permission gate.
+
+    This exists to remove a duplicate-delivery trap. The documented way to
+    interrupt an agent used to be a bare `paseo send`, which the queue knows
+    nothing about: if the message had also been queued, the dispatcher
+    delivered it a SECOND time later. Routing the interrupt through the queue
+    means the message is recorded, delivered once, and moved to sent/, so no
+    dispatcher will ever pick it up again.
+
+    What is bypassed, deliberately: the `paseo inspect` status check, the
+    `paseo wait` loop that holds until the agent is idle, and the
+    pending-permission hold. That IS the interrupt. FIFO is also bypassed --
+    this message jumps any backlog, which is why the receipt says
+    "interrupted" rather than "delivered".
+    """
+    path = os.path.join(agent_dir, "pending", filename)
+
+    # Narrow the one real correctness hazard: a live dispatcher already inside
+    # a `paseo send` for this agent. Sending concurrently would put two
+    # prompts into one agent at once. The per-agent lock is the wrong gate
+    # here, because a dispatcher holds it for its whole lifetime including
+    # linger, so waiting on it would make an "interrupt" wait ten seconds for
+    # an idle dispatcher. The state file marks the actual send window, so wait
+    # only for that, briefly, and proceed regardless -- an interrupt that
+    # silently becomes a queued message is worse than a warned-about race.
+    grace = env_int("PASEO_QUEUE_INTERRUPT_GRACE", 10)
+    waited = 0
+    while read_state(agent_dir) == "sending" and waited < grace:
+        time.sleep(1)
+        waited += 1
+    raced = read_state(agent_dir) == "sending"
+    if raced:
+        log_line(agent_dir, "INTERRUPT-RACE",
+                 "msg=%s dispatcher still sending after %ss" % (filename, grace))
+        sys.stderr.write("paseo-queue: add --interrupt: a dispatcher is still "
+                         "sending for %s; delivering anyway (possible "
+                         "concurrent prompt)\n" % short_id)
+
+    log_line(agent_dir, "INTERRUPT-BEGIN", filename)
+    stderr_path = os.path.join(agent_dir, "tmp", "interrupt.%d" % os.getpid())
+    try:
+        with open(stderr_path, "wb") as stderr_stream:
+            send_rc = subprocess.call(
+                ["paseo", "send", uuid, "--prompt-file", path],
+                stdout=subprocess.DEVNULL, stderr=stderr_stream)
+    except (IOError, OSError):
+        send_rc = 1
+
+    if send_rc == 0:
+        try:
+            byte_count = os.path.getsize(path)
+            os.replace(path, os.path.join(agent_dir, "sent", filename))
+        except OSError as exc:
+            log_line(agent_dir, "INTERRUPT-FAIL",
+                     "msg=%s error=%s" % (filename, exc))
+            spawn_dispatcher(uuid)
+            return die("add --interrupt: delivered but could not file the "
+                       "message as sent (%s); it may be delivered again" % exc)
+        log_line(agent_dir, "INTERRUPT-OK",
+                 "msg=%s bytes=%s" % (filename, byte_count))
+        try:
+            os.unlink(stderr_path)
+        except OSError:
+            pass
+        if not quiet:
+            sys.stdout.write("paseo-queue: interrupted %s %s\n"
+                             % (short_id, filename))
+        return 0
+
+    # Failed to interrupt. Leave the message in pending/ and hand it to a
+    # dispatcher, so the caller's message is not lost -- it degrades to an
+    # ordinary queued message. Exit non-zero so the caller knows it did NOT
+    # get the immediate delivery it asked for.
+    tail = ""
+    try:
+        with open(stderr_path, "r") as stream:
+            tail = stream.read().strip().splitlines()[-1:]
+            tail = tail[0] if tail else ""
+    except (IOError, OSError, IndexError):
+        tail = ""
+    log_line(agent_dir, "INTERRUPT-FAIL",
+             "msg=%s rc=%s %s" % (filename, send_rc, tail))
+    spawn_dispatcher(uuid)
+    return die("add --interrupt: immediate send failed (rc=%s); message stays "
+               "queued for normal delivery%s"
+               % (send_rc, (": " + tail) if tail else ""))
 
 
 def spawn_dispatcher(uuid):
@@ -548,7 +737,7 @@ def cmd_add(args):
     parsed, code = parse_add(args)
     if code:
         return code
-    agent_query, text, file_path, wait, timeout, quiet, use_stdin = parsed
+    agent_query, text, file_path, wait, timeout, quiet, use_stdin, interrupt = parsed
     resolved = resolve_agent(agent_query, allow_orphan=False)
     if resolved is None:
         return LAST_RESOLVE_RC
@@ -597,7 +786,12 @@ def cmd_add(args):
         filename = next_msg_name(agent_dir)
         os.replace(stage_path, os.path.join(agent_dir, "pending", filename))
         log_line(agent_dir, "ENQ", "%s %s" % (uuid, filename))
-        spawn_dispatcher(uuid)
+        # An interrupt delivers this message itself, so it must NOT also spawn
+        # a dispatcher here: that dispatcher would race it for the same file.
+        # If the interrupt send fails, deliver_interrupt spawns one so the
+        # message degrades to an ordinary queued message rather than sitting.
+        if not interrupt:
+            spawn_dispatcher(uuid)
     except (IOError, OSError, RuntimeError) as exc:
         try:
             os.unlink(stage_path)
@@ -609,6 +803,8 @@ def cmd_add(args):
     if not quiet:
         sys.stdout.write("paseo-queue: enqueued %s pending/%s\n" % (short_id, filename))
         sys.stdout.flush()
+    if interrupt:
+        return deliver_interrupt(agent_dir, uuid, filename, quiet, short_id)
     if wait:
         return wait_for_delivery(agent_dir, filename,
                                  int(timeout) if timeout is not None else None,

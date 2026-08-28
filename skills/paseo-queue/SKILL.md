@@ -1,6 +1,6 @@
 ---
 name: paseo-queue
-description: Queue routine and non-emergency prompts to Paseo agents for ordered FIFO delivery with permission holds. Use as the default coordination path regardless of whether the target appears busy. Reserve paseo send for messages important enough to interrupt current work.
+description: Queue routine and non-emergency prompts to Paseo agents for ordered FIFO delivery with permission holds. Use as the default coordination path regardless of whether the target appears busy. For urgent messages use `paseo-queue add --interrupt`, which delivers immediately and records the send; prefer it over a bare `paseo send`, which the queue cannot see and which risks a duplicate delivery.
 ---
 
 ## Why
@@ -10,9 +10,16 @@ Queueing is the default for routine and non-emergency coordination.
 it once the agent is idle with no pending permission. Delivery is strict
 FIFO per agent; queues to different agents run in parallel.
 
-`paseo send` is the priority interrupt path. Use it when the message is
-important enough to interrupt the target's current work and intentionally
-take precedence over ordinary queued coordination.
+For a message urgent enough to interrupt, use `paseo-queue add <agent>
+"msg" --interrupt`. It delivers immediately -- skipping the wait for the
+agent to go idle and skipping the pending-permission hold -- and files the
+message as sent.
+
+Prefer that over a bare `paseo send`. A direct send happens outside the
+queue, so the queue has no record of it: if the same message was also queued,
+a dispatcher delivers it a SECOND time later, and the sender has no way to
+see that coming. Routing the interrupt through the queue means the message is
+recorded, delivered once, and can never be re-delivered.
 
 ## Commands
 
@@ -26,6 +33,12 @@ take precedence over ordinary queued coordination.
   print `delivered <shortid> <file>`; exit 4 on `--wait-timeout N` elapsed
   (message stays queued). Use this when you need to report that a message
   actually arrived.
+- `paseo-queue add <agent> "text" --interrupt` — deliver NOW, bypassing the
+  idle wait and the permission hold, and file it as sent. Use this instead of
+  `paseo send` for anything you would otherwise queue: it cannot be delivered
+  twice, and it leaves a record. Jumps any backlog, so its receipt reads
+  `interrupted`. A failed immediate send leaves the message queued and exits
+  nonzero.
 - `paseo-queue add <agent> "text" --quiet` — suppress the receipt lines
   (errors still print). For callers that only check the exit status.
 - `paseo-queue ls` — list every agent's queue (pending/sent/failed counts).
@@ -52,7 +65,9 @@ candidate on stderr — name matching is exact, never a prefix.
 
 - Default `add` is fire-and-forget — do not poll or `paseo wait` on it.
 - Use the queue for every non-emergency prompt, even when the target appears idle.
-- Do not use plain `paseo send` merely to jump queued items. Bypass FIFO when
+- Do not use plain `paseo send` at all for content you would otherwise queue --
+  it is invisible to the queue and risks a duplicate delivery. Use
+  `--interrupt`. Bypass FIFO when
   the message genuinely warrants interrupting current work.
 - Use `--wait` only when the next step depends on dispatch. It does not prove
   that the recipient completed the requested work.

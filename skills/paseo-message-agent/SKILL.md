@@ -1,6 +1,6 @@
 ---
 name: paseo-message-agent
-description: Coordinate with another Paseo-managed agent. Use `paseo-queue add` for routine or non-emergency reports, handoffs, policy updates, and follow-ups so FIFO ordering and permission holds are preserved. Reserve `paseo send` for messages important enough to interrupt the agent's current work.
+description: Coordinate with another Paseo-managed agent. Use `paseo-queue add` for routine or non-emergency reports, handoffs, policy updates, and follow-ups so FIFO ordering and permission holds are preserved. For messages important enough to interrupt, use `paseo-queue add --interrupt` rather than a bare `paseo send`: it delivers immediately and records the send, so the message cannot be delivered twice.
 ---
 
 # Paseo Message Agent
@@ -11,7 +11,13 @@ Choose transport by urgency:
 
 - For routine or non-emergency coordination, use `paseo-queue add <agent> "msg"`. This is the default even when the target might be idle; it preserves per-agent FIFO order and permission holds.
 - Add `--wait` only when the next step must block until dispatch. It confirms delivery to the agent, not completion of the requested work.
-- Use `paseo send` only when the message is important enough to interrupt the target's current work. Direct send is the intentional priority path, not a convenience shortcut around the queue.
+- To interrupt, use `paseo-queue add <agent-id> "<message>" --interrupt`. It
+  delivers immediately, skipping the idle wait and the permission hold, and
+  files the message as sent so no dispatcher re-delivers it.
+- Avoid a bare `paseo send` for content you would otherwise queue. The queue
+  has no record of a direct send, so a message that was also queued gets
+  delivered a second time later. Reach for `paseo send` only when you need
+  the raw transport and are deliberately not queueing at all.
 
 ## Transport
 
@@ -26,8 +32,8 @@ paseo-queue add <agent-id> "<message>" --wait
 Interruption-worthy path:
 
 ```bash
-paseo send <agent-id> "<message>"
-paseo send <agent-id> --prompt-file /path/to/message.txt
+paseo-queue add <agent-id> "<message>" --interrupt
+paseo-queue add <agent-id> --file /path/to/message.txt --interrupt
 ```
 
 `<agent-id>` may be a full ID or an accepted prefix. Multi-line text, including
