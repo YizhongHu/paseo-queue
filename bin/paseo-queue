@@ -118,6 +118,12 @@ def resolve_agent(query, allow_orphan=True):
 
     if len(candidates) == 1:
         LAST_RESOLVE_RC = 0
+        # This is a LIVE match, so the name in hand is authoritative. Refresh
+        # the display cache that `ls` reads, so a rename converges as soon as
+        # anything touches the agent. See refresh_agent_name.
+        matched_uuid, matched_name = candidates[0]
+        refresh_agent_name(os.path.join(queue_home(), matched_uuid),
+                           matched_uuid, matched_name)
         return candidates[0]
     if len(candidates) > 1:
         sys.stderr.write('paseo-queue: ambiguous agent "%s", candidates:\n' % query)
@@ -165,6 +171,31 @@ def agent_name(agent_dir):
 def write_agent_name(agent_dir, uuid, name):
     with open(os.path.join(agent_dir, "agent.name"), "w") as stream:
         stream.write("%s %s\n" % (uuid[:7], name))
+
+
+def refresh_agent_name(agent_dir, uuid, name):
+    """Update the cached name if it has drifted from the live one.
+
+    agent.name is a display cache. `ls` reads it and deliberately never
+    contacts the daemon, so `ls` keeps working during an outage -- it is the
+    command you run WHEN things are broken. The cost of that choice is that a
+    renamed agent shows a stale name in `ls`, and a stale name does not
+    resolve, so `ls` could advertise an identifier the tool then rejects
+    (issue #9).
+
+    The fix is to refresh the cache from every command that already holds a
+    live name, rather than to make `ls` daemon-dependent. Best effort: a
+    failure to write is never worth failing a command over, since the only
+    consequence is a display name staying stale a little longer.
+    """
+    if not name or not os.path.isdir(agent_dir):
+        return
+    try:
+        if agent_name(agent_dir) == name:
+            return
+        write_agent_name(agent_dir, uuid, name)
+    except (IOError, OSError):
+        pass
 
 
 def env_int(name, default):
@@ -912,6 +943,11 @@ def cmd_status(args):
             continue
         name = live_names.get(entry, agent_name(agent_dir))
         orphan_tag = "" if entry in live_names else " ORPHANED"
+        # status holds live names for EVERY known agent, not just one, so it
+        # is the cheapest place to converge the whole set: one `status` run
+        # refreshes every stale display name that `ls` would otherwise show.
+        if entry in live_names:
+            refresh_agent_name(agent_dir, entry, name)
         state = "unknown"
         state_path = os.path.join(agent_dir, "state")
         if os.path.isfile(state_path):
