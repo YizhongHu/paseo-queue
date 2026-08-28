@@ -112,6 +112,36 @@ print("%s %s %d" % (str(status).lower(), 1 if archived else 0, len(perms)))
 PY
 )"
 
+# Detached dispatcher spawn. Not JSON bridging like the three above, but it
+# lives here for the same reason: python3 is already a hard dependency of
+# agent resolution, so using it to get setsid(2) costs nothing new and
+# stays inside the contributor rules (no `setsid` binary -- absent on
+# macOS -- and no bashisms). start_new_session=True makes the child a
+# session leader, so a process-group teardown of the CALLER can no longer
+# reach it. `stop` is unaffected: it signals the dispatcher pid directly.
+PQ_PY_SPAWN="$(cat <<'PY'
+import os, subprocess, sys
+
+self_path, uuid, logpath = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    log = open(logpath, "ab", 0)
+except OSError:
+    log = subprocess.DEVNULL
+try:
+    subprocess.Popen(
+        [self_path, "_dispatch", uuid],
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=log,
+        start_new_session=True,
+        close_fds=True,
+    )
+except Exception as exc:
+    sys.stderr.write("spawn_dispatcher: %s\n" % exc)
+    raise SystemExit(1)
+PY
+)"
+
 # --- Usage ---------------------------------------------------------------
 usage() {
     cat <<'EOF'
@@ -506,19 +536,30 @@ release_lock() {
 }
 
 spawn_dispatcher() {
-    # spawn_dispatcher <uuid> -- unconditionally forks a backgrounded
-    # `paseo-queue _dispatch <uuid>` subshell. The dispatcher itself
-    # competes for the per-agent lock and exits immediately (logging SKIP)
-    # if a live holder already exists, so it is always safe to call this
-    # without checking first (closes the enqueue-vs-exiting-dispatcher
+    # spawn_dispatcher <uuid> -- unconditionally starts a detached
+    # `paseo-queue _dispatch <uuid>` in its OWN SESSION. The dispatcher
+    # itself competes for the per-agent lock and exits immediately (logging
+    # SKIP) if a live holder already exists, so it is always safe to call
+    # this without checking first (closes the enqueue-vs-exiting-dispatcher
     # race). PASEO_QUEUE_NO_SPAWN=1 (internally PQ_NO_SPAWN) disables the
-    # fork entirely, for test harnesses that drive `_dispatch` manually.
+    # spawn entirely, for test harnesses that drive `_dispatch` manually.
+    #
+    # This used to be a plain `( ... & )` subshell fork, which left the
+    # dispatcher in the CALLER's process group and session. Callers are
+    # frequently short-lived sandboxed agent shells, and when such a shell's
+    # process group is torn down the group signal reached the dispatcher
+    # too, killing it seconds after it started -- observed in the wild as
+    # `EXIT reason=signal sig=TERM` one second after START, with the message
+    # left in pending/ and `add` having already returned 0. See
+    # PQ_PY_SPAWN's comment for why python3 is the portable way to get
+    # setsid(2) here.
     sd_uuid="$1"
     if [ "$PQ_NO_SPAWN" = "1" ]; then
         return 0
     fi
     sd_dir="$PQ_HOME/$sd_uuid"
-    ( "$0" _dispatch "$sd_uuid" </dev/null >>"$sd_dir/dispatch.log" 2>&1 & )
+    python3 -c "$PQ_PY_SPAWN" "$0" "$sd_uuid" "$sd_dir/dispatch.log" \
+        </dev/null >/dev/null 2>&1
     return 0
 }
 
@@ -1138,7 +1179,24 @@ cmd_dispatch() {
     dp_was_stale=0
     dp_lock_is_stale "$dp_dir" && dp_was_stale=1
 
+    # Arm the signal traps BEFORE acquiring the lock, not after logging
+    # START. A signal landing in the acquire-to-START window used to hit the
+    # shell's default action, leaving lock/ behind with this pid inside it
+    # and no log line at all -- a queue that then looks like "ENQ with no
+    # START" and stays stuck until some later process happens to steal the
+    # stale lock. release_lock() is a no-op unless lock/pid names us, so
+    # arming early is safe even before the mkdir. dp_stderr_tmp is assigned
+    # first because the handler unlinks it and this script runs under
+    # `set -u`, where an unset variable in the trap would abort cleanup.
+    dp_stderr_tmp="$dp_dir/tmp/stderr.$$"
+    trap 'dp_cleanup_on_signal INT' INT
+    trap 'dp_cleanup_on_signal TERM' TERM
+
     if ! acquire_lock "$dp_dir"; then
+        # Disarm before this exit: we hold nothing to clean up, and the
+        # handler would otherwise set_state stopped and log a signal EXIT on
+        # behalf of the LIVE dispatcher that owns the lock.
+        trap - INT TERM
         dp_holder_pid="none"
         [ -f "$dp_dir/lock/pid" ] && dp_holder_pid="$(cat "$dp_dir/lock/pid" 2>/dev/null)"
         log_line "$dp_dir" SKIP "$dp_uuid" "lock held by live dispatcher pid=$dp_holder_pid"
@@ -1148,11 +1206,6 @@ cmd_dispatch() {
     if [ "$dp_was_stale" -eq 1 ]; then
         log_line "$dp_dir" STEAL "$dp_uuid" "stale lock cleared"
     fi
-
-    dp_stderr_tmp="$dp_dir/tmp/stderr.$$"
-
-    trap 'dp_cleanup_on_signal INT' INT
-    trap 'dp_cleanup_on_signal TERM' TERM
 
     set_state "$dp_dir" running
     log_line "$dp_dir" START "$dp_uuid" "pid=$$"
