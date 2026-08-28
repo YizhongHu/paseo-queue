@@ -149,6 +149,7 @@ Usage: paseo-queue <subcommand> [args]
 
 Subcommands:
   add <agent> [text|--file <path>|stdin] [--wait] [--wait-timeout <seconds>]
+      [--quiet]
       Enqueue a message for delivery to <agent>. Message content comes from
       exactly one source: a single [text] argument, --file <path>, or piped
       stdin (mutually exclusive; with none given and stdin is a tty, this
@@ -158,7 +159,11 @@ Subcommands:
       it contains whitespace (including markdown bullets); use -- only for
       a whitespace-free token such as -v.
       Default: returns 0 immediately after the message is enqueued and the
-      dispatcher is (re)spawned (fire-and-forget).
+      dispatcher is (re)spawned (fire-and-forget), printing one receipt line
+      naming the queued file:
+        paseo-queue: enqueued 2d4c857 pending/1787883101-0099103-0000.msg
+      Exit 0 there means ENQUEUED, not delivered; with --wait a second line
+      reports delivery. --quiet suppresses both lines (errors still print).
       --wait: block until the message leaves pending/: exit 0 once it is
       in sent/; exit 1 once it is in failed/ or the dispatcher state becomes
       halted-closed, halted-failed, or stalled-daemon (message stays
@@ -171,7 +176,9 @@ Subcommands:
 
   rm <agent> <msg|--all>
       Delete one pending message (by filename) or all pending messages for
-      <agent>. After --all, if the agent's state directory is then fully
+      <agent>. Every removed filename is printed, plus a count for --all, so
+      a destructive default is never silent.
+      After --all, if the agent's state directory is then fully
       empty (no pending/sent/failed/tmp files, no lock) and the agent is
       orphaned (absent from `paseo ls`), the directory itself is removed.
 
@@ -642,6 +649,7 @@ cmd_add() {
     ca_wait_timeout=""
     ca_use_stdin=0
     ca_saw_dashdash=0
+    ca_quiet=0
 
     # Flags (--file/--wait/--wait-timeout/--) and the single positional
     # message-text argument may appear in ANY order or interspersed --
@@ -677,6 +685,9 @@ cmd_add() {
                 ;;
             --wait)
                 ca_wait=1
+                ;;
+            --quiet)
+                ca_quiet=1
                 ;;
             --wait-timeout)
                 [ "$ca_i" -lt "$ca_orig_count" ] || die 1 "add: --wait-timeout requires a value in seconds"
@@ -773,9 +784,28 @@ cmd_add() {
     log_line "$ca_dir" ENQ "$ca_uuid" "$ca_msgname"
     spawn_dispatcher "$ca_uuid"
 
+    # Receipt on stdout. Success used to emit zero bytes on both streams, so
+    # the only positive signal a caller had was the ABSENCE of output --
+    # which made a stranded message indistinguishable from a delivered one
+    # (exactly how a ~21h delivery outage went unnoticed) and gave a
+    # sandboxed agent no way to tell "sent" from "silently did nothing".
+    # Printed before any --wait blocking so the receipt is available
+    # immediately, and it names the pending/ filename so the caller has a
+    # concrete artefact to check rather than having to run `ls` and count.
+    if [ "$ca_quiet" -eq 0 ]; then
+        printf 'paseo-queue: enqueued %s pending/%s\n' "$ca_short" "$ca_msgname"
+    fi
+
     if [ "$ca_wait" -eq 1 ]; then
         pq_wait_for_delivery "$ca_dir" "$ca_msgname" "$ca_wait_timeout"
-        exit "$?"
+        ca_wait_rc=$?
+        # Exit 0 from a bare `add` means ENQUEUED; only --wait can report
+        # DELIVERED, and it said nothing on success. The rc 1 and rc 4
+        # branches already explain themselves on stderr.
+        if [ "$ca_wait_rc" -eq 0 ] && [ "$ca_quiet" -eq 0 ]; then
+            printf 'paseo-queue: delivered %s %s\n' "$ca_short" "$ca_msgname"
+        fi
+        exit "$ca_wait_rc"
     fi
 
     exit 0
@@ -813,15 +843,23 @@ cmd_rm() {
     cr_dir="$PQ_HOME/$cr_uuid"
     [ -d "$cr_dir" ] || die 1 "rm: no queue state for $cr_agent_query"
 
+    cr_short="$(printf '%.7s' "$cr_uuid")"
+
     if [ "$cr_target" = "--all" ]; then
         cr_removed=0
         if [ -d "$cr_dir/pending" ]; then
             for cr_f in "$cr_dir/pending"/*.msg; do
                 [ -e "$cr_f" ] || continue
+                # Name each casualty. A destructive default that printed
+                # nothing gave the caller no chance to notice that --all had
+                # taken more than they meant, including undelivered reports
+                # they never knew existed.
+                printf 'paseo-queue: removed %s pending/%s\n' "$cr_short" "${cr_f##*/}"
                 rm -f "$cr_f"
                 cr_removed=$((cr_removed + 1))
             done
         fi
+        printf 'paseo-queue: removed %s pending message(s) for %s\n' "$cr_removed" "$cr_short"
         log_line "$cr_dir" CANCEL "$cr_uuid" "--all ($cr_removed removed)"
         if pq_dir_is_empty "$cr_dir" && ! pq_agent_known "$cr_uuid"; then
             rm -rf "$cr_dir"
@@ -843,6 +881,7 @@ cmd_rm() {
     cr_msgfile="$cr_dir/pending/$cr_target"
     [ -e "$cr_msgfile" ] || die 1 "rm: no such pending message: $cr_target"
     rm -f "$cr_msgfile" || die 1 "rm: failed to remove $cr_target"
+    printf 'paseo-queue: removed %s pending/%s\n' "$cr_short" "$cr_target"
     log_line "$cr_dir" CANCEL "$cr_uuid" "$cr_target"
     exit 0
 }

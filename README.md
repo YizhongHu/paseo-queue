@@ -85,7 +85,7 @@ paseo-queue <subcommand> [args]
 
 ### Subcommands
 
-- **`add <agent> [text|--file <path>|stdin] [--wait] [--wait-timeout <seconds>]`**
+- **`add <agent> [text|--file <path>|stdin] [--wait] [--wait-timeout <seconds>] [--quiet]`**
   Enqueue a message for delivery to `<agent>`. Message content comes from
   exactly one source: a single `[text]` argument, `--file <path>`, or piped
   stdin (mutually exclusive; if none is given and stdin is a tty, this is
@@ -94,6 +94,13 @@ paseo-queue <subcommand> [args]
   into one argument). Dash-leading text is accepted inline when it contains
   whitespace (including markdown bullets); use `--` only for a whitespace-free
   token such as `-v`.
+  On success it prints one receipt line naming the queued file, so a caller
+  has a concrete artefact to check rather than only the absence of an error:
+  ```
+  paseo-queue: enqueued 2d4c857 pending/1787883101-0099103-0000.msg
+  ```
+  Exit `0` there means *enqueued*, not delivered; `--wait` adds a second
+  line reporting delivery. `--quiet` suppresses both (errors still print).
 
 - **`ls`**
   List every known agent's queue: pending/sent/failed counts and the
@@ -101,9 +108,11 @@ paseo-queue <subcommand> [args]
 
 - **`rm <agent> <msg|--all>`**
   Delete one pending message (by filename) or all pending messages for
-  `<agent>`. After `--all`, if the agent's state directory is then fully
-  empty (no pending/sent/failed/tmp files, no lock) and the agent is
-  orphaned (absent from `paseo ls`), the directory itself is removed.
+  `<agent>`. Every removed filename is printed, plus a count for `--all`, so
+  a destructive default is never silent. After `--all`, if the agent's state
+  directory is then fully empty (no pending/sent/failed/tmp files, no lock)
+  and the agent is orphaned (absent from `paseo ls`), the directory itself is
+  removed.
 
 - **`status`**
   Show, per agent: state (from the dispatcher-owned state file),
@@ -133,8 +142,10 @@ paseo-queue <subcommand> [args]
 ### Delivery modes
 
 - **Default (fire-and-forget):** `add` returns `0` immediately once the
-  message is atomically enqueued and the dispatcher is (re)spawned. It does
-  not wait for delivery.
+  message is atomically enqueued and the dispatcher is (re)spawned, printing
+  an `enqueued <shortid> pending/<file>` receipt. It does not wait for
+  delivery, and the receipt says `enqueued` rather than `delivered` for
+  exactly that reason.
 - **`--wait`:** blocks until the message leaves `pending/`:
   - exits `0` once the message is observed in `sent/`;
   - exits `1` once it is observed in `failed/`, or once the dispatcher

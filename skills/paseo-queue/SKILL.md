@@ -17,13 +17,22 @@ take precedence over ordinary queued coordination.
 ## Commands
 
 - `paseo-queue add <agent> "text"` — enqueue a message, fire-and-forget.
+  Prints `enqueued <shortid> pending/<file>` on success. That receipt means
+  *enqueued*, not delivered — treat it as proof the message was accepted,
+  not proof the target read it.
 - `paseo-queue add <agent> --file f` — enqueue message content from a file.
 - `echo hi | paseo-queue add <agent>` — enqueue message content from stdin.
-- `paseo-queue add <agent> "text" --wait` — block until actually sent; exit
-  4 on `--wait-timeout N` elapsed (message stays queued).
+- `paseo-queue add <agent> "text" --wait` — block until actually sent, then
+  print `delivered <shortid> <file>`; exit 4 on `--wait-timeout N` elapsed
+  (message stays queued). Use this when you need to report that a message
+  actually arrived.
+- `paseo-queue add <agent> "text" --quiet` — suppress the receipt lines
+  (errors still print). For callers that only check the exit status.
 - `paseo-queue ls` — list every agent's queue (pending/sent/failed counts).
 - `paseo-queue status` — per-agent state, counts, dispatcher liveness.
-- `paseo-queue rm <agent> <msg|--all>` — delete one or all pending messages.
+- `paseo-queue rm <agent> <msg|--all>` — delete one or all pending messages;
+  prints every filename it removes. Read that output before moving on:
+  `--all` can take undelivered messages you did not know were queued.
 - `paseo-queue log <agent>` — show the dispatch log.
 - `paseo-queue drain <agent>` — force-(re)start the dispatcher.
 - `paseo-queue stop <agent>` — SIGTERM the live dispatcher (queue untouched).
