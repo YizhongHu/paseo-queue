@@ -18,6 +18,13 @@
   `start_new_session=True`. Inheriting the caller's process group is what
   caused issue #4: short-lived agent shells took their dispatchers down with
   them and stranded messages silently for ~21 hours.
+- **An interrupt must file its message as sent.** `add --interrupt` performs
+  the `paseo send` itself and then moves the message into `sent/`. That move
+  is what makes the delivery single: a message left in `pending/` after a
+  successful send will be delivered a SECOND time by the next dispatcher.
+  This is exactly the trap a bare `paseo send` falls into, and the reason
+  `--interrupt` exists. If you change the interrupt path, the invariant to
+  preserve is *sent exactly once, and recorded* — not merely *sent*.
 - **Install signal handlers before acquiring the lock.** A signal arriving
   between `acquire_lock` and the `START` log line otherwise strands `lock/`
   holding a dead pid with no log line. The path that fails to acquire the
