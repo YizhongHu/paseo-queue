@@ -80,3 +80,9 @@ candidate on stderr — name matching is exact, never a prefix.
 
 Messages are capped at 256 KiB by default (`PASEO_QUEUE_MAX_BYTES`). This
 is a local stopgap — delete it once getpaseo/paseo#3797 ships upstream.
+
+FIFO is per-agent and holds for queued messages, but `--interrupt`
+deliberately jumps the backlog: an interrupted message is delivered before
+anything already waiting. Its receipt reads `interrupted` rather than
+`delivered` so this is visible in logs. If ordering matters more than
+immediacy, queue it normally.

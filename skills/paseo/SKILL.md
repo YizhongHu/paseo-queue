@@ -121,7 +121,7 @@ paseo workspace create --isolation worktree --mode checkout-pr --pr-number 42
 paseo run --provider codex/gpt-5.4 --mode full-access --workspace <workspace-id> "<prompt>"
 paseo run --provider codex/gpt-5.4 --mode full-access --new-workspace worktree --worktree-mode branch-off --new-branch fix-x --base main "<prompt>"
 paseo-queue add <agent-id> "<routine follow-up>"
-paseo send <agent-id> "<urgent interruption-worthy follow-up>"
+paseo-queue add <agent-id> "<urgent interruption-worthy follow-up>" --interrupt
 paseo ls
 paseo schedule create --cron "*/15 * * * *" "ping main build"
 paseo heartbeat create --cron "*/15 * * * *" "check the build"

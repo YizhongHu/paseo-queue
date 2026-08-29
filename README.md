@@ -10,10 +10,12 @@ while follow-ups to the *same* agent are always delivered one at a time, in
 enqueue order.
 
 This exists because Paseo has no built-in "deliver at the agent's next
-convenience" primitive. `paseo send` deliberately delivers immediately and
-is appropriate when a message is important enough to interrupt current work;
-routine prompts use this queue to preserve FIFO order and permission holds.
-`paseo wait` is a broadcast release shared by every waiter, not a queue.
+convenience" primitive. Routine prompts use this queue to preserve FIFO order
+and permission holds. When a message *is* urgent enough to interrupt, use
+`add --interrupt` rather than a bare `paseo send`: the queue performs the send
+itself, so the message is recorded and cannot later be delivered a second time
+by a dispatcher. `paseo wait` is a broadcast release shared by every waiter,
+not a queue.
 
 ## Prerequisites
 
@@ -60,9 +62,21 @@ paseo-queue add <agent> --file handoff.md
 paseo-queue add <agent> "deliver before my next step" --wait
 ```
 
-Use `paseo send <agent> "message"` when a message is important enough to
-interrupt the agent's current work. The queue is the default for routine and
-non-emergency coordination.
+When a message is important enough to interrupt the agent's current work,
+interrupt *through* the queue:
+
+```sh
+paseo-queue add <agent> "urgent: stop before the deploy step" --interrupt
+```
+
+That delivers immediately — skipping both the wait for the agent to go idle
+and the pending-permission hold — and files the message in `sent/`.
+
+Prefer it over a bare `paseo send`. A direct send happens outside the queue,
+so the queue has no record of it: if the same message was also queued, a
+dispatcher delivers it a **second time** later, and the sender has no way to
+see that coming. The queue is still the default for routine and non-emergency
+coordination.
 
 ## Skill backups
 
@@ -163,6 +177,18 @@ paseo-queue <subcommand> [args]
     (the message stays queued in all three cases);
   - exits `4` if `--wait-timeout <seconds>` elapses first (the message
     stays queued; `--wait-timeout` implies `--wait`).
+- **`--interrupt`:** delivers that message immediately, bypassing both the
+  wait for the agent to become idle and the pending-permission hold, then
+  files it in `sent/` before returning. Prints a second receipt line reading
+  `interrupted <shortid> <file>` rather than `delivered`, because it also
+  jumps any queued backlog — the wording is deliberate so that a log reader
+  can see FIFO was broken on purpose. Because the queue performs the send
+  itself, the message is recorded once and no dispatcher will ever deliver it
+  again; this is the difference from a bare `paseo send`, which the queue
+  cannot see. If the immediate send fails the message is **left queued** for
+  normal delivery, a dispatcher is spawned, and the exit status is `1` — the
+  caller loses the immediacy, never the message. Cannot be combined with
+  `--wait`, which would have nothing left to wait for.
 
 ### Agent argument forms
 
@@ -179,6 +205,30 @@ way, from a single `paseo ls --json` snapshot:
 matches an existing `$PASEO_QUEUE_HOME` state directory even when the agent
 no longer appears in `paseo ls` (the "orphan" escape hatch). This never
 applies to `add`/`drain`, which require a live agent.
+
+### Dispatch log events
+
+`paseo-queue log <agent>` shows the per-agent `dispatch.log`. Every line is
+`<timestamp> [<pid>] <EVENT> <detail>`. The vocabulary, since these are what
+you actually read when diagnosing a delivery:
+
+| Event | Meaning |
+|-------|---------|
+| `ENQ` | A message was enqueued. Written by `add`, not by the dispatcher. |
+| `START` | A dispatcher acquired the lock and began work. |
+| `SKIP` | A dispatcher found the lock held by a live holder and exited without doing anything. Normal and expected — every `add` spawns one. |
+| `STEAL` | A dispatcher found a lock whose recorded pid was dead and reclaimed it. |
+| `WAIT-BUSY` | The agent is busy; the dispatcher is holding the message and waiting for idle. Rate-limited by `PASEO_QUEUE_HOLD_LOG_EVERY`. |
+| `HOLD-PERM` | The agent has a pending permission request; delivery is held. Same rate limit. |
+| `SEND-BEGIN` / `SEND-OK` / `SEND-FAIL` | A normal queued delivery starting, succeeding (with byte count), or failing. |
+| `RETRY` | A transient send failure is being retried, with attempt count. |
+| `HALT` | The dispatcher stopped on a terminal condition — see the state file for which (`halted-closed`, `halted-failed`, `stalled-daemon`). |
+| `INTERRUPT-BEGIN` / `INTERRUPT-OK` / `INTERRUPT-FAIL` | An `add --interrupt` delivery. `INTERRUPT-OK` means the message was sent and filed in `sent/`, so no dispatcher will re-deliver it. `INTERRUPT-FAIL` means the message was left queued for normal delivery. |
+| `INTERRUPT-RACE` | An `--interrupt` proceeded while a dispatcher was still inside a send for the same agent, after waiting `PASEO_QUEUE_INTERRUPT_GRACE` seconds. Two prompts may have reached the agent close together. |
+| `CANCEL` | A pending message was removed by `rm`, or vanished before its send. |
+| `LINGER` / `REACQUIRE` / `YIELD` / `EXIT` | Dispatcher lifecycle: idling on an empty queue, resuming because work arrived, standing down because another dispatcher took the lock, and exiting (with a reason). |
+| `STOP` | A `stop` command SIGTERM'd this dispatcher, naming the pid. |
+| `MOVE-FAILED` / `FATAL` | The dispatcher could not file a delivered message, or hit an unexpected error. Both are worth investigating; neither should occur in normal operation. |
 
 ## State layout
 
@@ -220,7 +270,7 @@ value below unless overridden.
 | Code | Meaning |
 |------|---------|
 | `0`  | Ok. |
-| `1`  | Error (validation failure, missing dispatcher, no message, a `--wait`ed message reaching `failed/`/`halted-*`, etc.). |
+| `1`  | Error (validation failure, missing dispatcher, no message, a `--wait`ed message reaching `failed/`/`halted-*`, a failed `--interrupt` whose message stays queued, etc.). |
 | `2`  | Agent resolution failure (not found or ambiguous). |
 | `3`  | Daemon unreachable (`paseo ls`/`paseo inspect` failed). |
 | `4`  | `add --wait-timeout` elapsed (message remains queued). |
@@ -259,10 +309,15 @@ flags the two conditions below with a stderr `WARN` line.
   embed the epoch second, and delivery pops the lexicographically-first
   filename, so a clock that jumps backwards between two enqueues can make
   the later message sort before the earlier one.
-- **Direct send bypasses queued ordering.** Calling plain `paseo send` on
-  an agent with messages in `pending/` intentionally takes priority and can
-  deliver out of order relative to the queue. Use it when interruption is
-  warranted; use `paseo-queue add` for non-emergency coordination.
+- **Interrupting bypasses queued ordering, by design.** `add --interrupt`
+  on an agent with messages in `pending/` delivers ahead of them. That is the
+  point, and the `interrupted` receipt makes it visible; but if ordering
+  matters more than immediacy, queue normally.
+- **A bare `paseo send` is invisible to the queue.** It delivers out of order
+  like an interrupt, but leaves no record, so a message that was *also*
+  queued will be delivered a second time when a dispatcher reaches it. Use
+  `add --interrupt` for anything you would otherwise queue; reserve plain
+  `paseo send` for cases where you are deliberately not queueing at all.
 
 ## Disposability
 
