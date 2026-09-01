@@ -661,6 +661,48 @@ def deliver_interrupt(agent_dir, uuid, filename, quiet, short_id):
 
     log_line(agent_dir, "INTERRUPT-BEGIN", filename)
     stderr_path = os.path.join(agent_dir, "tmp", "interrupt.%d" % os.getpid())
+
+    # CRASH SAFETY. The normal enqueue path is recoverable by construction:
+    # `add` spawns a dispatcher, so if anything dies the dispatcher still
+    # delivers. The interrupt path deliberately does NOT spawn one up front
+    # (it would race this process for the same file), which means a death
+    # between INTERRUPT-BEGIN and the move into sent/ used to strand the
+    # message in pending/ with nothing left to recover it. That was observed
+    # in the wild: a queue sat at "ENQ then INTERRUPT-BEGIN then silence" for
+    # 14 hours.
+    #
+    # So: catch the signals that a process-group teardown or a Ctrl-C would
+    # deliver, and guarantee via `finally` that if the message is still in
+    # pending/ when this function unwinds for ANY reason, a dispatcher is
+    # spawned to pick it up. A SIGKILL still cannot be caught -- nothing in
+    # process can help there -- but such a message stays in pending/ and is
+    # recovered by the next `add`, `drain` or dispatcher spawn for that agent.
+    def _interrupt_bail(signum, unused_frame):
+        raise KeyboardInterrupt("signal %s during interrupt send" % signum)
+
+    prev_int = signal.getsignal(signal.SIGINT)
+    prev_term = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGINT, _interrupt_bail)
+    signal.signal(signal.SIGTERM, _interrupt_bail)
+    try:
+        return _deliver_interrupt_send(agent_dir, uuid, filename, quiet,
+                                       short_id, path, stderr_path)
+    except (KeyboardInterrupt, SystemExit):
+        log_line(agent_dir, "INTERRUPT-ABORT",
+                 "msg=%s aborted mid-delivery; leaving it queued" % filename)
+        raise
+    finally:
+        signal.signal(signal.SIGINT, prev_int)
+        signal.signal(signal.SIGTERM, prev_term)
+        # The single guarantee: a message still in pending/ always has a
+        # dispatcher coming for it.
+        if os.path.exists(path):
+            spawn_dispatcher(uuid)
+
+
+def _deliver_interrupt_send(agent_dir, uuid, filename, quiet, short_id, path,
+                            stderr_path):
+    """The send itself. Wrapped by deliver_interrupt for crash safety."""
     try:
         with open(stderr_path, "wb") as stderr_stream:
             send_rc = subprocess.call(
@@ -676,7 +718,6 @@ def deliver_interrupt(agent_dir, uuid, filename, quiet, short_id):
         except OSError as exc:
             log_line(agent_dir, "INTERRUPT-FAIL",
                      "msg=%s error=%s" % (filename, exc))
-            spawn_dispatcher(uuid)
             return die("add --interrupt: delivered but could not file the "
                        "message as sent (%s); it may be delivered again" % exc)
         log_line(agent_dir, "INTERRUPT-OK",
@@ -703,7 +744,6 @@ def deliver_interrupt(agent_dir, uuid, filename, quiet, short_id):
         tail = ""
     log_line(agent_dir, "INTERRUPT-FAIL",
              "msg=%s rc=%s %s" % (filename, send_rc, tail))
-    spawn_dispatcher(uuid)
     return die("add --interrupt: immediate send failed (rc=%s); message stays "
                "queued for normal delivery%s"
                % (send_rc, (": " + tail) if tail else ""))
