@@ -224,6 +224,7 @@ you actually read when diagnosing a delivery:
 | `RETRY` | A transient send failure is being retried, with attempt count. |
 | `HALT` | The dispatcher stopped on a terminal condition — see the state file for which (`halted-closed`, `halted-failed`, `stalled-daemon`). |
 | `INTERRUPT-BEGIN` / `INTERRUPT-OK` / `INTERRUPT-FAIL` | An `add --interrupt` delivery. `INTERRUPT-OK` means the message was sent and filed in `sent/`, so no dispatcher will re-deliver it. `INTERRUPT-FAIL` means the message was left queued for normal delivery. |
+| `INTERRUPT-ABORT` | An `add --interrupt` was killed mid-delivery (SIGINT/SIGTERM). The message was left in `pending/` and a dispatcher was spawned to recover it, so it still gets delivered by the normal path. |
 | `INTERRUPT-RACE` | An `--interrupt` proceeded while a dispatcher was still inside a send for the same agent, after waiting `PASEO_QUEUE_INTERRUPT_GRACE` seconds. Two prompts may have reached the agent close together. |
 | `CANCEL` | A pending message was removed by `rm`, or vanished before its send. |
 | `LINGER` / `REACQUIRE` / `YIELD` / `EXIT` | Dispatcher lifecycle: idling on an empty queue, resuming because work arrived, standing down because another dispatcher took the lock, and exiting (with a reason). |

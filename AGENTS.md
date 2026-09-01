@@ -18,6 +18,18 @@
   `start_new_session=True`. Inheriting the caller's process group is what
   caused issue #4: short-lived agent shells took their dispatchers down with
   them and stranded messages silently for ~21 hours.
+- **A message in `pending/` must always have a dispatcher coming for it.**
+  This is what makes the queue recoverable: `add` spawns a dispatcher, so any
+  death still leaves the message deliverable. `add --interrupt` deliberately
+  does NOT spawn one up front, because it would race the interrupt for the
+  same file — so it carries the obligation itself, via a `finally` that
+  spawns a dispatcher whenever the message is still in `pending/` as the
+  function unwinds, plus SIGINT/SIGTERM handlers so a process-group teardown
+  reaches that `finally`. Removing either half reintroduces a real defect: a
+  killed interrupt once stranded a message for 14 hours, its log frozen at
+  `INTERRUPT-BEGIN` with nothing following. SIGKILL cannot be caught and is
+  the accepted residual; such a message is recovered by the next `add` or
+  `drain` for that agent.
 - **An interrupt must file its message as sent.** `add --interrupt` performs
   the `paseo send` itself and then moves the message into `sent/`. That move
   is what makes the delivery single: a message left in `pending/` after a
