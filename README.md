@@ -177,6 +177,22 @@ paseo-queue <subcommand> [args]
     (the message stays queued in all three cases);
   - exits `4` if `--wait-timeout <seconds>` elapses first (the message
     stays queued; `--wait-timeout` implies `--wait`).
+
+  **Without `--wait-timeout` there is no deadline** — `--wait` blocks until
+  the message resolves. While waiting it prints progress to stderr every
+  `PASEO_QUEUE_WAIT_PROGRESS_EVERY` seconds (default 15), naming how many
+  messages are ahead of yours and what the dispatcher is doing:
+
+  ```
+  paseo-queue: add --wait: 45s elapsed; 2 message(s) ahead; state=sending for 94s
+  ```
+
+  **Expect long waits, and they are usually not a fault.** Delivery is strictly
+  FIFO per agent, and `paseo send` blocks until the receiving agent has
+  *processed* the prompt — measured over 1574 real deliveries its median is
+  **57 seconds**, with p90 at 230s. So a `--wait` is the sum of every
+  predecessor's processing time plus your own. If you need to jump that queue,
+  use `--interrupt`.
 - **`--interrupt`:** delivers that message immediately, bypassing both the
   wait for the agent to become idle and the pending-permission hold, then
   files it in `sent/` before returning. Prints a second receipt line reading
@@ -284,6 +300,7 @@ value below unless overridden.
 | `PASEO_QUEUE_LINGER`             | `10`                 | Dispatcher idle linger, seconds, before it exits an empty queue. |
 | `PASEO_QUEUE_WAIT_TIMEOUT`       | `60`                 | Timeout passed to the dispatcher's internal `paseo wait` call. |
 | `PASEO_QUEUE_MAX_BYTES`          | `262144`             | Max enqueued message size in bytes. |
+| `PASEO_QUEUE_WAIT_PROGRESS_EVERY`| `15`                 | Seconds between `add --wait` progress lines on stderr; `0` disables them. |
 | `PASEO_QUEUE_INTERRUPT_GRACE`    | `10`                 | Seconds `add --interrupt` waits for an in-flight dispatcher send before proceeding anyway. |
 | `PASEO_QUEUE_LS_RETRY_DELAY`     | `0.5`                | Seconds to wait before retrying a failed `paseo ls --json` snapshot fetch. |
 | `PASEO_QUEUE_SEND_RETRIES`       | `5`                  | Transient send-failure retry count before a message is moved to `failed/`. |
