@@ -231,6 +231,31 @@ you actually read when diagnosing a delivery:
 | `STOP` | A `stop` command SIGTERM'd this dispatcher, naming the pid. |
 | `MOVE-FAILED` / `FATAL` | The dispatcher could not file a delivered message, or hit an unexpected error. Both are worth investigating; neither should occur in normal operation. |
 
+### Daemon diagnostics
+
+Every `paseo-queue` command needs one `paseo ls --json` snapshot to resolve
+the agent. That call fails intermittently, so it is **retried once** — a
+transient blip no longer loses your command — and every failure is recorded
+to `$PASEO_QUEUE_HOME/daemon.log`:
+
+```
+2026-09-05T00:39:40-0400 [11506] LS-FAIL attempt=1 rc=7 ms=393 bytes=0 load=10.02 parse_error=- stderr=paseo: connection refused
+2026-09-05T00:39:41-0400 [11520] LS-RECOVERED attempt=2 ms=19 load=10.02 prev_rc=1 prev_err=connect: connection refused
+```
+
+Each record carries the exit code, how long the call took, how many bytes
+came back, the **load average** (load is the suspected trigger), any JSON
+parse error, and the daemon's own stderr. `LS-RECOVERED` means the retry
+worked and the command proceeded — useful for telling a transient blip from
+a real outage after the fact. The log rotates at 1 MiB to `daemon.log.1`.
+
+This exists because the daemon's failures were not reproducible on demand,
+which was partly this tool's fault: it previously ran the snapshot fetch with
+stderr discarded, so the single most diagnostic artefact was thrown away
+every time. A malformed response was also treated as an empty fleet, so a
+daemon fault surfaced as `no agent matches` rather than as a daemon fault;
+it is now correctly reported as exit 3.
+
 ## State layout
 
 Each agent gets one state directory `$PASEO_QUEUE_HOME/<full-uuid>/`
@@ -260,6 +285,7 @@ value below unless overridden.
 | `PASEO_QUEUE_WAIT_TIMEOUT`       | `60`                 | Timeout passed to the dispatcher's internal `paseo wait` call. |
 | `PASEO_QUEUE_MAX_BYTES`          | `262144`             | Max enqueued message size in bytes. |
 | `PASEO_QUEUE_INTERRUPT_GRACE`    | `10`                 | Seconds `add --interrupt` waits for an in-flight dispatcher send before proceeding anyway. |
+| `PASEO_QUEUE_LS_RETRY_DELAY`     | `0.5`                | Seconds to wait before retrying a failed `paseo ls --json` snapshot fetch. |
 | `PASEO_QUEUE_SEND_RETRIES`       | `5`                  | Transient send-failure retry count before a message is moved to `failed/`. |
 | `PASEO_QUEUE_DAEMON_RETRIES`     | `15`                 | Transient daemon-unreachable retry count before the dispatcher halts as `stalled-daemon`. |
 | `PASEO_QUEUE_HOLD_LOG_EVERY`     | `300`                | Rate limit (seconds) for repeated `HOLD-PERM` log lines. |
