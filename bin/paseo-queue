@@ -37,7 +37,13 @@ Subcommands:
       in sent/; exit 1 once it is in failed/ or the dispatcher state becomes
       halted-closed, halted-failed, or stalled-daemon (message stays
       queued); exit 4 if --wait-timeout elapses first (message stays
-      queued). --wait-timeout implies --wait.
+      queued). --wait-timeout implies --wait. WITHOUT --wait-timeout there is
+      NO deadline: --wait blocks until the message resolves. While waiting it
+      reports progress on stderr every PASEO_QUEUE_WAIT_PROGRESS_EVERY
+      seconds, naming how many messages are ahead and what the dispatcher is
+      doing -- expect long waits, since delivery is FIFO per agent and a
+      `paseo send` blocks until the agent has PROCESSED the prompt (median
+      ~57s, minutes at p90). --quiet suppresses progress but not errors.
       --interrupt: deliver THIS message immediately, bypassing both the wait
       for the agent to become idle and the pending-permission hold, then file
       it in sent/. Prefer it over a bare `paseo send` for anything you would
@@ -113,6 +119,8 @@ Environment knobs (all test-overridable):
                                 integer (default: 1; tests only)
   PASEO_QUEUE_INTERRUPT_GRACE   Seconds add --interrupt waits for an in-flight
                                 dispatcher send before proceeding (default: 10)
+  PASEO_QUEUE_WAIT_PROGRESS_EVERY  Seconds between add --wait progress lines
+                                (default: 15; 0 disables)
 
 Exit codes:
   0  ok
@@ -524,9 +532,41 @@ def queue_dir_is_empty(agent_dir):
     return not os.path.exists(os.path.join(agent_dir, "lock"))
 
 
+def queue_position(agent_dir, filename):
+    """How many pending messages sort ahead of ours. 0 means we are next."""
+    try:
+        names = sorted(os.path.basename(p) for p in
+                       glob.glob(os.path.join(agent_dir, "pending", "*.msg")))
+    except OSError:
+        return None
+    return sum(1 for n in names if n < filename)
+
+
+def state_age(agent_dir):
+    """Seconds since the state file last changed, or None."""
+    try:
+        return int(time.time() - os.path.getmtime(os.path.join(agent_dir, "state")))
+    except OSError:
+        return None
+
+
 def wait_for_delivery(agent_dir, filename, timeout, quiet, short_id):
+    # NO TIMEOUT unless the caller asked for one. This previously defaulted to
+    # PASEO_QUEUE_WAIT_TIMEOUT (60s) -- a knob that means something else
+    # entirely, the DISPATCHER's `paseo wait` timeout -- so a bare `--wait`
+    # gave up after 60 seconds and reported "add --wait-timeout: 60s elapsed"
+    # to a caller who never passed --wait-timeout. Both the shell
+    # implementation ("an empty timeout waits indefinitely") and README
+    # ("blocks until the message leaves pending/") promise otherwise.
+    #
+    # It also read as the tool being broken, because a `paseo send` takes 57s
+    # at the median: the timeout was firing at roughly the transport's own
+    # typical latency, so a perfectly healthy delivery would routinely lose
+    # the race with it.
     if timeout is None:
-        timeout = env_int("PASEO_QUEUE_WAIT_TIMEOUT", 60)
+        timeout = -1
+    progress_every = env_int("PASEO_QUEUE_WAIT_PROGRESS_EVERY", 15)
+    last_progress = 0
     elapsed = 0
     while True:
         if os.path.exists(os.path.join(agent_dir, "sent", filename)):
@@ -548,6 +588,29 @@ def wait_for_delivery(agent_dir, filename, timeout, quiet, short_id):
         if timeout >= 0 and elapsed >= timeout:
             return die("add --wait-timeout: %ss elapsed; message still queued" % timeout,
                        EXIT_TIMEOUT)
+
+        # Say what is being waited ON. A silent multi-minute wait is
+        # indistinguishable from a hang, and the honest answer is usually
+        # "queued behind a slow send" rather than anything wrong: delivery is
+        # strictly FIFO per agent and `paseo send` blocks until the agent has
+        # PROCESSED the prompt, so the wait is the sum of every predecessor's
+        # processing time.
+        if (not quiet and progress_every > 0 and elapsed > 0
+                and elapsed - last_progress >= progress_every):
+            last_progress = elapsed
+            ahead = queue_position(agent_dir, filename)
+            state = read_state(agent_dir) or "unknown"
+            detail = "state=%s" % state
+            if state == "sending":
+                age = state_age(agent_dir)
+                if age is not None:
+                    detail = "state=sending for %ss" % age
+            if ahead:
+                detail = "%s message(s) ahead; %s" % (ahead, detail)
+            sys.stderr.write("paseo-queue: add --wait: %ss elapsed; %s\n"
+                             % (elapsed, detail))
+            sys.stderr.flush()
+
         time.sleep(1)
         elapsed += 1
 
@@ -787,6 +850,14 @@ def deliver_interrupt(agent_dir, uuid, filename, quiet, short_id):
     finally:
         signal.signal(signal.SIGINT, prev_int)
         signal.signal(signal.SIGTERM, prev_term)
+        # Do not leave the scratch stderr file behind. An aborted interrupt
+        # used to leak tmp/interrupt.<pid>, and since `rm --all` only
+        # garbage-collects an orphaned queue when pending/sent/failed/tmp are
+        # ALL empty, that stub kept a dead agent's directory alive forever.
+        try:
+            os.unlink(stderr_path)
+        except OSError:
+            pass
         # The single guarantee: a message still in pending/ always has a
         # dispatcher coming for it.
         if os.path.exists(path):
@@ -1293,9 +1364,18 @@ def cmd_status(args):
         sent = len(message_files(os.path.join(agent_dir, "sent")))
         failed = len(message_files(os.path.join(agent_dir, "failed")))
         alive, pid = dispatcher_alive(agent_dir)
+        # How long the current state has held. A dispatcher five minutes into
+        # a send looks identical to one that just started otherwise, and
+        # `paseo send` runs to a 57s median, so "sending" alone tells you
+        # nothing about whether to worry.
+        shown_state = state
+        if state in ("sending", "waiting", "holding-permission"):
+            age = state_age(agent_dir)
+            if age is not None and age >= 5:
+                shown_state = "%s(%ss)" % (state, age)
         sys.stdout.write(
             "%s %s%s: state=%s pending=%d sent=%d failed=%d dispatcher=%s(pid=%s)\n"
-            % (entry, name, orphan_tag, state, pending, sent, failed,
+            % (entry, name, orphan_tag, shown_state, pending, sent, failed,
                "up" if alive else "down", pid))
         if pending and not alive:
             sys.stderr.write(
