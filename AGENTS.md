@@ -18,6 +18,15 @@
   `start_new_session=True`. Inheriting the caller's process group is what
   caused issue #4: short-lived agent shells took their dispatchers down with
   them and stranded messages silently for ~21 hours.
+- **Never discard the daemon's stderr.** `paseo ls --json` fails
+  intermittently and those failures are hard to reproduce; the tool used to
+  route that stderr to DEVNULL, destroying the evidence on every occurrence.
+  Failures go to `$PASEO_QUEUE_HOME/daemon.log` with exit code, duration,
+  byte count, load average and stderr. Diagnostics are best effort and must
+  never be able to fail a command.
+- **A malformed daemon response is a daemon fault, not an empty fleet.**
+  Parsing failure must surface as exit 3, never as a silently empty agent
+  list — that is how a truncated read masqueraded as `no agent matches`.
 - **A message in `pending/` must always have a dispatcher coming for it.**
   This is what makes the queue recoverable: `add` spawns a dispatcher, so any
   death still leaves the message deliverable. `add --interrupt` deliberately

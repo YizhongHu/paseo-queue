@@ -147,21 +147,114 @@ def is_uuid(value):
     return len(value) == 36 and [len(part) for part in parts] == [8, 4, 4, 4, 12]
 
 
-def fetch_ls_json():
-    """Fetch and parse the daemon snapshot once per process."""
-    global LS_JSON_FETCHED, LS_JSON_OUT, LS_JSON_RC, LS_JSON_ROWS
-    if LS_JSON_FETCHED:
-        return LS_JSON_RC
+def load_average():
+    """1-minute load average, or "?" where unavailable."""
+    try:
+        return "%.2f" % os.getloadavg()[0]
+    except (OSError, AttributeError):
+        return "?"
+
+
+def daemon_log(event, detail):
+    """Append one line to the daemon diagnostics log.
+
+    This exists because the daemon fails intermittently and the failures were
+    not reproducible on demand -- which was partly the tool's own fault: it
+    ran `paseo ls --json` with stderr routed to DEVNULL, so the single most
+    diagnostic artifact, the daemon's own error text, was discarded every
+    time. An unreproducible fault needs an evidence trail, not a retry of the
+    investigation.
+
+    Written to $PASEO_QUEUE_HOME/daemon.log rather than a per-agent log,
+    because a daemon fault is fleet-wide and belongs in one place. Best
+    effort: diagnostics must never be able to fail a command.
+    """
+    try:
+        home = queue_home()
+        if not os.path.isdir(home):
+            os.makedirs(home)
+        path = os.path.join(home, "daemon.log")
+        # Cheap rotation so this can never grow without bound.
+        try:
+            if os.path.getsize(path) > 1024 * 1024:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
+        with open(path, "a") as stream:
+            stream.write("%s [%s] %s %s\n" % (stamp, os.getpid(), event, detail))
+    except (IOError, OSError):
+        pass
+
+
+def _run_ls_json():
+    """One `paseo ls --json` attempt. Returns (rc, stdout, stderr, ms)."""
+    started = time.time()
     try:
         process = subprocess.Popen(
             ["paseo", "ls", "--json"],
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL)
-        LS_JSON_OUT, unused_stderr = process.communicate()
-        LS_JSON_RC = process.returncode
-    except OSError:
-        LS_JSON_OUT = b""
-        LS_JSON_RC = 1
+            stderr=subprocess.PIPE)
+        out, err = process.communicate()
+        rc = process.returncode
+    except OSError as exc:
+        return 1, b"", ("could not execute paseo: %s" % exc).encode("utf-8"), \
+               int((time.time() - started) * 1000)
+    return rc, out, err, int((time.time() - started) * 1000)
+
+
+def _err_tail(err):
+    try:
+        lines = [l for l in err.decode("utf-8", "replace").strip().splitlines() if l.strip()]
+    except Exception:
+        return ""
+    return lines[-1][:300] if lines else ""
+
+
+def fetch_ls_json():
+    """Fetch and parse the daemon snapshot once per process.
+
+    Retries once on failure. The daemon fails transiently under load, and
+    without a retry a single blip loses the caller's whole command -- they
+    have to retype the message. Every failure is recorded to daemon.log with
+    enough context to diagnose it after the fact: exit code, duration, the
+    daemon's own stderr, the load average, and whether the retry recovered.
+    """
+    global LS_JSON_FETCHED, LS_JSON_OUT, LS_JSON_RC, LS_JSON_ROWS
+    if LS_JSON_FETCHED:
+        return LS_JSON_RC
+
+    attempts = []
+    for attempt in (1, 2):
+        rc, out, err, ms = _run_ls_json()
+        parsed = None
+        parse_error = ""
+        if rc == 0:
+            try:
+                parsed = json.loads(out.decode("utf-8"))
+            except (ValueError, UnicodeError) as exc:
+                # A malformed response is a DAEMON failure, not an empty
+                # fleet. Treating it as empty is how a truncated read used to
+                # surface as "no agent matches", hiding the real fault.
+                parse_error = str(exc)[:200]
+        attempts.append((rc, ms, _err_tail(err), len(out), parse_error))
+        if rc == 0 and not parse_error:
+            LS_JSON_OUT, LS_JSON_RC = out, 0
+            if attempt == 2:
+                daemon_log("LS-RECOVERED",
+                           "attempt=2 ms=%s load=%s prev_rc=%s prev_err=%s"
+                           % (ms, load_average(), attempts[0][0], attempts[0][2] or "-"))
+            break
+        daemon_log("LS-FAIL",
+                   "attempt=%s rc=%s ms=%s bytes=%s load=%s parse_error=%s stderr=%s"
+                   % (attempt, rc, ms, len(out), load_average(),
+                      parse_error or "-", _err_tail(err) or "-"))
+        if attempt == 1:
+            time.sleep(float(os.environ.get("PASEO_QUEUE_LS_RETRY_DELAY", "0.5")))
+        else:
+            LS_JSON_OUT = out
+            LS_JSON_RC = rc if rc != 0 else EXIT_DAEMON
+
     LS_JSON_FETCHED = True
     if LS_JSON_RC == 0:
         try:
