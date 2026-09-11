@@ -116,15 +116,26 @@ paseo-queue <subcommand> [args]
   Exit `0` there means *enqueued*, not delivered; `--wait` adds a second
   line reporting delivery. `--quiet` suppresses both (errors still print).
 
-  `--interrupt` delivers that message immediately — skipping both the wait for
-  the agent to become idle and the pending-permission hold — and files it in
-  `sent/`. Prefer it over a bare `paseo send` for anything you would otherwise
+  `--interrupt` delivers that message immediately — skipping the wait for the
+  agent to become idle, the pending-permission hold, and any queued backlog —
+  and files it in `sent/`. It genuinely reaches a *running* agent: measured 6
+  seconds from send to the agent acknowledging it mid-work, 74 seconds before
+  its current task would have finished. The send passes `--no-wait`, so the
+  call returns once the daemon accepts the prompt rather than blocking until
+  the agent has processed it. Prefer it over a bare `paseo send` for anything you would otherwise
   queue: the queue performs the send itself, so the message is recorded once
   and no dispatcher can deliver it again. A direct `paseo send` is invisible to
   the queue, so a message that was also queued arrives twice. `--interrupt`
   jumps any backlog, which is why its receipt reads `interrupted` rather than
   `delivered`; a failed immediate send leaves the message queued and exits
   nonzero.
+
+  One semantic difference worth knowing: for a queued message, `sent/` means
+  the receiving agent *processed* it, because the dispatcher waits for that.
+  For an `--interrupt` it means the daemon *accepted* it — delivery is prompt
+  but the caller does not wait for processing. That is the intended trade:
+  blocking an interrupt's sender for the recipient's thinking time is what
+  made interrupts look broken.
 
 - **`ls`**
   List every known agent's queue: pending/sent/failed counts and the

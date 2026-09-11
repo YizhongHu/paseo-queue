@@ -44,9 +44,14 @@ Subcommands:
       doing -- expect long waits, since delivery is FIFO per agent and a
       `paseo send` blocks until the agent has PROCESSED the prompt (median
       ~57s, minutes at p90). --quiet suppresses progress but not errors.
-      --interrupt: deliver THIS message immediately, bypassing both the wait
-      for the agent to become idle and the pending-permission hold, then file
-      it in sent/. Prefer it over a bare `paseo send` for anything you would
+      --interrupt: deliver THIS message NOW, bypassing the wait for the agent
+      to become idle, the pending-permission hold, and any queued backlog,
+      then file it in sent/. `paseo send` does genuinely interrupt a running
+      agent: measured 6s from send to the agent acknowledging it mid-work.
+      The send uses --no-wait, so this returns once the daemon has accepted
+      the prompt rather than blocking until the agent has finished processing
+      it -- without that, an interrupt that landed in seconds did not return
+      for minutes and looked to its sender like a failure. Prefer it over a bare `paseo send` for anything you would
       otherwise queue: the queue performs the send itself, so the message is
       recorded and no dispatcher can ever deliver it a second time. It also
       jumps any queued backlog, which is why its receipt reads "interrupted"
@@ -869,8 +874,21 @@ def _deliver_interrupt_send(agent_dir, uuid, filename, quiet, short_id, path,
     """The send itself. Wrapped by deliver_interrupt for crash safety."""
     try:
         with open(stderr_path, "wb") as stderr_stream:
+            # --no-wait: return once the daemon has ACCEPTED the prompt,
+            # rather than blocking until the agent has finished PROCESSING
+            # it. Delivery is prompt either way -- `paseo send` genuinely
+            # interrupts a running agent, measured at 6s from send to the
+            # agent acknowledging mid-tool-call. What was slow was the
+            # CALLER: without --no-wait the send does not return for a
+            # median of 59s and up to 605s, so an interrupt that had already
+            # landed looked to its sender like one that had failed. That
+            # misreading is exactly what prompted this fix.
+            #
+            # The dispatcher's own send deliberately does NOT use --no-wait:
+            # its FIFO, one-at-a-time guarantee depends on knowing the
+            # previous message finished processing before starting the next.
             send_rc = subprocess.call(
-                ["paseo", "send", uuid, "--prompt-file", path],
+                ["paseo", "send", uuid, "--no-wait", "--prompt-file", path],
                 stdout=subprocess.DEVNULL, stderr=stderr_stream)
     except (IOError, OSError):
         send_rc = 1
