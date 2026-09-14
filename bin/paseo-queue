@@ -30,7 +30,10 @@ Subcommands:
       Default: returns 0 immediately after the message is enqueued and the
       dispatcher is (re)spawned (fire-and-forget), printing one receipt line
       naming the queued file:
-        paseo-queue: enqueued 2d4c857 (target: idle) pending/1787883101-0099103-0000.msg
+        paseo-queue: enqueued 2d4c857 (target: idle, 2 ahead) pending/1787883101-...msg
+      naming the target's state and how many messages sort ahead of yours, so
+      a sender can see where it landed without running `ls`. The position is
+      omitted for --priority/--interrupt, which jump the backlog.
       The target's daemon-reported state is named because `enqueued` is a
       statement about the SENDER's side only: correctly addressed and on
       disk. A `closed` target additionally warns on stderr, since its
@@ -66,8 +69,9 @@ Subcommands:
       WRONG -- a stop order, a correction, a revoked assumption -- not for
       routine status, acks or completions. If the target was not running,
       nothing is cancelled and the receipt says so.
-      Neither flag can be combined with --wait, which would have nothing
-      left to wait for. Prefer either over a bare `paseo send`: the queue
+      --priority and --interrupt are MUTUALLY EXCLUSIVE: state one intent.
+      Neither can be combined with --wait, which would have nothing left to
+      wait for -- they have already delivered when they return. Prefer either over a bare `paseo send`: the queue
       performs the send itself, so the message is recorded and no dispatcher
       can deliver it a second time.
 
@@ -743,6 +747,8 @@ def parse_add(args):
     quiet = False
     priority = False
     preempt = False
+    saw_priority = False
+    saw_interrupt = False
     positional = []
     index = 0
     literal = False
@@ -765,11 +771,14 @@ def parse_add(args):
             quiet = True
         elif token == "--priority":
             priority = True
+            saw_priority = True
         elif token == "--interrupt":
-            # The stronger form: cancels the current turn first. Implies the
-            # immediate delivery that --priority does.
+            # Cancels the current turn, then delivers. Both flags deliver
+            # immediately; they are mutually exclusive so a caller states one
+            # intent -- "jump the queue" or "stop what you are doing".
             preempt = True
             priority = True
+            saw_interrupt = True
         elif token == "--wait-timeout":
             if index >= len(tokens):
                 return None, die("add: --wait-timeout requires a value in seconds")
@@ -793,6 +802,10 @@ def parse_add(args):
     # --interrupt delivers before returning, so there is nothing left for
     # --wait to wait for. Accepting both would let a caller believe the wait
     # meant something.
+    if saw_priority and saw_interrupt:
+        return None, die("add: --priority and --interrupt are mutually exclusive; "
+                         "--priority jumps the queue and lets the agent keep "
+                         "working, --interrupt cancels its current turn")
     if priority and wait:
         return None, die("add: --priority/--interrupt already deliver before returning; --wait/--wait-timeout is redundant")
     if text is None and file_path is None:
@@ -1094,12 +1107,21 @@ def cmd_add(args):
     # revived, and that is worth saying out loud rather than leaving the
     # sender to discover it later from `status`.
     target_state = LAST_RESOLVE_STATUS or "unknown"
+    # How many messages sort ahead of this one -- "where am I in the queue",
+    # which is the question a sender actually has and previously had to run
+    # `ls` to guess at. Omitted for --priority/--interrupt, which jump the
+    # backlog and therefore have no position in it.
+    position = ""
+    if not priority:
+        ahead = queue_position(agent_dir, filename)
+        if ahead:
+            position = ", %d ahead" % ahead
     if not quiet:
         # Target state goes BEFORE the path so the pending/ filename stays the
         # LAST field: t-18 parses it that way, and so can any caller doing
         # `awk '{print $NF}'`. Appending would have silently broken both.
-        sys.stdout.write("paseo-queue: enqueued %s (target: %s) pending/%s\n"
-                         % (short_id, target_state, filename))
+        sys.stdout.write("paseo-queue: enqueued %s (target: %s%s) pending/%s\n"
+                         % (short_id, target_state, position, filename))
         sys.stdout.flush()
     if target_state in ("closed", "error"):
         sys.stderr.write(

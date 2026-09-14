@@ -1,6 +1,6 @@
 ---
 name: paseo-queue
-description: Queue prompts to Paseo agents for ordered FIFO delivery with permission holds. Three urgency levels, and you must choose deliberately: plain `add` for routine work, `add --priority` to jump the queue and arrive mid-work, `add --interrupt` to CANCEL the agent's current turn first (destructive). Prefer all three over a bare `paseo send`, which the queue cannot see and which risks a duplicate delivery.
+description: Queue prompts to Paseo agents for ordered FIFO delivery with permission holds. Answer two independent questions per message. Urgency: no flag (routine), `--priority` (jump the queue, arrive mid-work, agent carries on -- also how you steer), `--interrupt` (cancel its current turn; destructive; mutually exclusive with --priority). Blocking: default returns at once, `--wait` blocks with no deadline, `--wait-timeout N` is bounded. Prefer all of these over a bare `paseo send`, which the queue cannot see and which risks a duplicate delivery.
 ---
 
 ## Why
@@ -10,46 +10,61 @@ Queueing is the default for routine and non-emergency coordination.
 it once the agent is idle with no pending permission. Delivery is strict
 FIFO per agent; queues to different agents run in parallel.
 
-## Choose the urgency level deliberately
+## Two independent questions
 
-Three levels. Pick by asking what happens if the message waits, not by how
-important it feels.
+Every `add` answers two questions. They are independent -- answer both.
 
-**Plain `add` — the default.** Use unless you can name a concrete harm from
-waiting. Status reports, acknowledgements, completions, handoffs, questions
-that are not blocking anyone. The message is delivered FIFO once the agent is
-idle and has no pending permission. This is correct even when the target looks
-busy or idle-between-turns; a dispatcher is watching for you.
+### 1. How urgent is delivery?
 
-**`add --priority` — jump the queue.** Delivered ahead of anything already
-queued for that agent, without waiting for idle or for a permission hold. The
-agent sees it MID-WORK and keeps going; nothing it is doing is cancelled. Use
-when the message changes what the agent should do NEXT but its current step is
-still valid: a new constraint, a corrected path, a heads-up it needs before
-its next decision. Also use when a queued backlog would delay it
-unacceptably.
+| | flag | meaning |
+|---|---|---|
+| not urgent | *(none)* | delivered FIFO once the agent is idle with no pending permission |
+| urgent, but the agent's current work is still valid | `--priority` | jumps the backlog, arrives MID-WORK, agent carries on |
+| urgent, and the agent must STOP | `--interrupt` | runs `paseo stop` first; unreported in-flight work is LOST |
 
-**`add --interrupt` — cancel the current turn.** Runs `paseo stop` first, so
-the agent's in-flight work is LOST, including anything it had not yet
-reported. Use ONLY when letting the agent continue would be actively wrong:
+`--priority` and `--interrupt` are **mutually exclusive** -- state one intent.
 
-- a stop order ("do not merge", "do not submit", "halt the run")
-- a correction to a premise it is currently acting on
-- a revoked assumption, permission, or assignment
-- it is working on the wrong thing, or on something already done
+Pick by consequence, not by how important the message feels:
 
-Do NOT use it for routine status, acks, completions, or "this is important".
-Importance is not the test — the test is whether continuing causes damage.
-Cancelling a turn can destroy tens of minutes of unreported work.
+- **no flag** unless you can name a concrete harm from waiting. Status,
+  acknowledgements, completions, handoffs, non-blocking questions. Correct
+  even when the target looks busy or idle; a dispatcher is watching for you.
+- **`--priority`** when the message changes what the agent should do NEXT but
+  its current step is still valid: a new constraint, a corrected path, a
+  heads-up it needs before its next decision. Also when a backlog would delay
+  it unacceptably. This is also how you STEER an agent -- it reads the message
+  while still working and adjusts, without losing its context.
+- **`--interrupt`** only when letting it continue would be actively WRONG: a
+  stop order ("do not merge", "halt the run"), a correction to a premise it is
+  acting on, a revoked assumption or assignment, or it is working on the wrong
+  thing. Cancelling a turn can destroy tens of minutes of unreported work.
 
-If you are unsure between `--priority` and `--interrupt`, use `--priority`.
-The failure mode of being too gentle is a delay; the failure mode of being too
-aggressive is lost work.
+If unsure between the two, use `--priority`. Being too gentle costs a delay;
+being too aggressive costs work.
 
-Prefer any of the three over a bare `paseo send`. A direct send happens
-outside the queue, so the queue has no record of it: if the same message was
-also queued, a dispatcher delivers it a SECOND time later, and the sender has
-no way to see that coming.
+### 2. How much does your next step depend on it arriving?
+
+| | flag | behaviour |
+|---|---|---|
+| non-blocking | *(none)* | returns as soon as the message is queued |
+| blocking | `--wait` | blocks until resolved, NO deadline |
+| semi-blocking | `--wait-timeout N` | blocks up to N seconds, then exit 4 |
+
+`--wait` can legitimately take a long time and that is not a fault: delivery
+requires the recipient to finish PROCESSING, median 57s and p90 230s, plus
+every message queued ahead of yours. Do not get impatient and do not escalate
+to `--interrupt` because a `--wait` is slow. It reports progress every 15s
+naming how many messages are ahead and what the dispatcher is doing, and the
+enqueue receipt tells you your queue position up front.
+
+Axis 2 does not apply to `--priority`/`--interrupt`: they have already
+delivered by the time they return, so combining them with `--wait` is
+rejected.
+
+Prefer any of these over a bare `paseo send`. A direct send happens outside
+the queue, so the queue has no record of it: if the same message was also
+queued, a dispatcher delivers it a SECOND time later, and the sender has no
+way to see that coming.
 
 ## Commands
 
