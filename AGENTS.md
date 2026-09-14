@@ -18,6 +18,14 @@
   `start_new_session=True`. Inheriting the caller's process group is what
   caused issue #4: short-lived agent shells took their dispatchers down with
   them and stranded messages silently for ~21 hours.
+- **`--priority` and `--interrupt` are different promises.** `--priority`
+  jumps the queue and arrives mid-work, leaving the agent running.
+  `--interrupt` additionally runs `paseo stop`, cancelling the current turn
+  and destroying unreported work. Do not collapse them, and do not make
+  `--priority` stop anything: the distinction exists because one flag doing
+  both misled readers in both directions. Note `paseo stop` exits 0 even for
+  an unknown agent, so never infer "a turn was cancelled" from its exit
+  status -- use the resolved agent status, which resolve_agent records.
 - **Never discard the daemon's stderr.** `paseo ls --json` fails
   intermittently and those failures are hard to reproduce; the tool used to
   route that stderr to DEVNULL, destroying the evidence on every occurrence.
@@ -29,22 +37,23 @@
   list — that is how a truncated read masqueraded as `no agent matches`.
 - **A message in `pending/` must always have a dispatcher coming for it.**
   This is what makes the queue recoverable: `add` spawns a dispatcher, so any
-  death still leaves the message deliverable. `add --interrupt` deliberately
-  does NOT spawn one up front, because it would race the interrupt for the
+  death still leaves the message deliverable. `add --priority`/`--interrupt` deliberately
+  do NOT spawn one up front, because it would race the immediate send for the
   same file — so it carries the obligation itself, via a `finally` that
   spawns a dispatcher whenever the message is still in `pending/` as the
   function unwinds, plus SIGINT/SIGTERM handlers so a process-group teardown
   reaches that `finally`. Removing either half reintroduces a real defect: a
-  killed interrupt once stranded a message for 14 hours, its log frozen at
-  `INTERRUPT-BEGIN` with nothing following. SIGKILL cannot be caught and is
+  killed priority send once stranded a message for 14 hours, its log frozen at
+  `PRIORITY-BEGIN` with nothing following. SIGKILL cannot be caught and is
   the accepted residual; such a message is recovered by the next `add` or
   `drain` for that agent.
-- **An interrupt must file its message as sent.** `add --interrupt` performs
+- **An immediate send must file its message as sent.** `add --priority` and
+  `add --interrupt` perform
   the `paseo send` itself and then moves the message into `sent/`. That move
   is what makes the delivery single: a message left in `pending/` after a
   successful send will be delivered a SECOND time by the next dispatcher.
   This is exactly the trap a bare `paseo send` falls into, and the reason
-  `--interrupt` exists. If you change the interrupt path, the invariant to
+  these flags exist. If you change that path, the invariant to
   preserve is *sent exactly once, and recorded* — not merely *sent*.
 - **Install signal handlers before acquiring the lock.** A signal arriving
   between `acquire_lock` and the `START` log line otherwise strands `lock/`

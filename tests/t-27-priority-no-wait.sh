@@ -13,7 +13,7 @@
 # 605s across 2833 real deliveries. So an interrupt that had already landed in
 # 6 seconds left its sender blocked for minutes, and a real orchestrator
 # concluded from that silence that its messages had never been delivered --
-# they had, and the queue had the INTERRUPT-OK records to prove it.
+# they had, and the queue had the PRIORITY-OK records to prove it.
 #
 # Pinned here: the interrupt path passes --no-wait, and the DISPATCHER path
 # deliberately does not, because its FIFO one-at-a-time guarantee depends on
@@ -36,7 +36,7 @@ send_argv() {
 
 # --- the interrupt path passes --no-wait --------------------------------
 PASEO_QUEUE_NO_SPAWN=1 "$PQT_BIN" add "$AGENT_UUID" "interrupt probe" \
-    --interrupt --quiet
+    --priority --quiet
 assert_rc 0 "$?" "the interrupt should succeed"
 
 t27_sends="$(send_argv | wc -l | tr -d ' ')"
@@ -61,7 +61,7 @@ send_argv | grep -q -- "--no-wait" \
 : > "$MOCK_DIR/calls.log"
 dp_dir="$PASEO_QUEUE_HOME/$AGENT_UUID"
 PASEO_QUEUE_NO_SPAWN=1 "$PQT_BIN" add "$AGENT_UUID" "third probe" \
-    --interrupt --quiet
+    --priority --quiet
 assert_rc 0 "$?" "the second interrupt should succeed"
 
 t27_pending=0

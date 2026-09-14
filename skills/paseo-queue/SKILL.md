@@ -1,6 +1,6 @@
 ---
 name: paseo-queue
-description: Queue routine and non-emergency prompts to Paseo agents for ordered FIFO delivery with permission holds. Use as the default coordination path regardless of whether the target appears busy. For urgent messages use `paseo-queue add --interrupt`, which delivers immediately and records the send; prefer it over a bare `paseo send`, which the queue cannot see and which risks a duplicate delivery.
+description: Queue prompts to Paseo agents for ordered FIFO delivery with permission holds. Three urgency levels, and you must choose deliberately: plain `add` for routine work, `add --priority` to jump the queue and arrive mid-work, `add --interrupt` to CANCEL the agent's current turn first (destructive). Prefer all three over a bare `paseo send`, which the queue cannot see and which risks a duplicate delivery.
 ---
 
 ## Why
@@ -10,35 +10,75 @@ Queueing is the default for routine and non-emergency coordination.
 it once the agent is idle with no pending permission. Delivery is strict
 FIFO per agent; queues to different agents run in parallel.
 
-For a message urgent enough to interrupt, use `paseo-queue add <agent>
-"msg" --interrupt`. It delivers immediately -- skipping the wait for the
-agent to go idle and skipping the pending-permission hold -- and files the
-message as sent.
+## Choose the urgency level deliberately
 
-Prefer that over a bare `paseo send`. A direct send happens outside the
-queue, so the queue has no record of it: if the same message was also queued,
-a dispatcher delivers it a SECOND time later, and the sender has no way to
-see that coming. Routing the interrupt through the queue means the message is
-recorded, delivered once, and can never be re-delivered.
+Three levels. Pick by asking what happens if the message waits, not by how
+important it feels.
+
+**Plain `add` — the default.** Use unless you can name a concrete harm from
+waiting. Status reports, acknowledgements, completions, handoffs, questions
+that are not blocking anyone. The message is delivered FIFO once the agent is
+idle and has no pending permission. This is correct even when the target looks
+busy or idle-between-turns; a dispatcher is watching for you.
+
+**`add --priority` — jump the queue.** Delivered ahead of anything already
+queued for that agent, without waiting for idle or for a permission hold. The
+agent sees it MID-WORK and keeps going; nothing it is doing is cancelled. Use
+when the message changes what the agent should do NEXT but its current step is
+still valid: a new constraint, a corrected path, a heads-up it needs before
+its next decision. Also use when a queued backlog would delay it
+unacceptably.
+
+**`add --interrupt` — cancel the current turn.** Runs `paseo stop` first, so
+the agent's in-flight work is LOST, including anything it had not yet
+reported. Use ONLY when letting the agent continue would be actively wrong:
+
+- a stop order ("do not merge", "do not submit", "halt the run")
+- a correction to a premise it is currently acting on
+- a revoked assumption, permission, or assignment
+- it is working on the wrong thing, or on something already done
+
+Do NOT use it for routine status, acks, completions, or "this is important".
+Importance is not the test — the test is whether continuing causes damage.
+Cancelling a turn can destroy tens of minutes of unreported work.
+
+If you are unsure between `--priority` and `--interrupt`, use `--priority`.
+The failure mode of being too gentle is a delay; the failure mode of being too
+aggressive is lost work.
+
+Prefer any of the three over a bare `paseo send`. A direct send happens
+outside the queue, so the queue has no record of it: if the same message was
+also queued, a dispatcher delivers it a SECOND time later, and the sender has
+no way to see that coming.
 
 ## Commands
 
 - `paseo-queue add <agent> "text"` — enqueue a message, fire-and-forget.
-  Prints `enqueued <shortid> pending/<file>` on success. That receipt means
+  Prints `enqueued <shortid> (target: <state>) pending/<file>` on success;
+  a `closed` target also warns, because its dispatcher will halt rather than
+  deliver. That receipt means
   *enqueued*, not delivered — treat it as proof the message was accepted,
   not proof the target read it.
 - `paseo-queue add <agent> --file f` — enqueue message content from a file.
 - `echo hi | paseo-queue add <agent>` — enqueue message content from stdin.
 - `paseo-queue add <agent> "text" --wait` — block until actually sent, then
   print `delivered <shortid> <file>`; exit 4 on `--wait-timeout N` elapsed
-  (message stays queued). Use this when you need to report that a message
-  actually arrived.
-- `paseo-queue add <agent> "text" --interrupt` — deliver NOW, bypassing the
-  idle wait and the permission hold, and file it as sent. Use this instead of
-  `paseo send` for anything you would otherwise queue: it cannot be delivered
-  twice, and it leaves a record. Jumps any backlog, so its receipt reads
-  `interrupted`. A failed immediate send leaves the message queued and exits
-  nonzero.
+  (message stays queued). Use when you must report that a message actually
+  arrived.
+  EXPECT THIS TO BLOCK FOR MINUTES. There is no default deadline, and
+  delivery requires the recipient to finish PROCESSING the message: median
+  57s, p90 230s, up to ~10 minutes, plus the processing time of every message
+  queued ahead of yours. Pass `--wait-timeout <seconds>` if you cannot afford
+  that, and treat exit 4 as "still queued", not "failed".
+- `paseo-queue add <agent> "text" --priority` — jump to the front of the
+  queue and deliver now, bypassing the idle wait and the permission hold. The
+  agent receives it mid-work and carries on. Receipt reads `prioritised`. A
+  failed send leaves the message queued and exits nonzero.
+- `paseo-queue add <agent> "text" --interrupt` — CANCEL the agent's current
+  turn (`paseo stop`), then deliver. Destructive: unreported in-flight work is
+  lost. Implies `--priority`. Receipt reads `interrupted`, and it tells you
+  whether a running turn was actually cancelled. See the urgency section
+  above before using it.
 - `paseo-queue add <agent> "text" --quiet` — suppress the receipt lines
   (errors still print). For callers that only check the exit status.
 - `paseo-queue ls` — list every agent's queue (pending/sent/failed counts).
@@ -67,8 +107,7 @@ candidate on stderr — name matching is exact, never a prefix.
 - Use the queue for every non-emergency prompt, even when the target appears idle.
 - Do not use plain `paseo send` at all for content you would otherwise queue --
   it is invisible to the queue and risks a duplicate delivery. Use
-  `--interrupt`. Bypass FIFO when
-  the message genuinely warrants interrupting current work.
+  `--priority` to bypass FIFO, or `--interrupt` if the agent must stop.
 - Use `--wait` only when the next step depends on dispatch. It does not prove
   that the recipient completed the requested work.
 - If `status` shows `holding-permission`, a human must approve in the
@@ -81,8 +120,8 @@ candidate on stderr — name matching is exact, never a prefix.
 Messages are capped at 256 KiB by default (`PASEO_QUEUE_MAX_BYTES`). This
 is a local stopgap — delete it once getpaseo/paseo#3797 ships upstream.
 
-FIFO is per-agent and holds for queued messages, but `--interrupt`
-deliberately jumps the backlog: an interrupted message is delivered before
-anything already waiting. Its receipt reads `interrupted` rather than
-`delivered` so this is visible in logs. If ordering matters more than
-immediacy, queue it normally.
+FIFO is per-agent and holds for queued messages, but `--priority` and
+`--interrupt` deliberately jump the backlog: they are delivered before
+anything already waiting. Their receipts read `prioritised` and `interrupted`
+rather than `delivered`, so the bypass is visible in logs. If ordering matters
+more than immediacy, queue it normally.
