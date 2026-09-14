@@ -36,7 +36,7 @@ PASEO_QUEUE_NO_SPAWN=1 "$PQT_BIN" add "$AGENT_UUID" "urgent while busy" \
     --interrupt >"$SANDBOX/int.out" 2>"$SANDBOX/int.err"
 assert_rc 0 "$?" "--interrupt should deliver even though the agent is busy"
 
-assert_grep "$SANDBOX/int.out" "^paseo-queue: enqueued a000002 pending/" \
+assert_grep "$SANDBOX/int.out" "^paseo-queue: enqueued a000002 (target: [a-z]*) pending/" \
     "--interrupt should still print the enqueue receipt"
 assert_grep "$SANDBOX/int.out" "^paseo-queue: interrupted a000002 " \
     "--interrupt should report the interrupt, not a normal delivery"

@@ -30,7 +30,14 @@ Subcommands:
       Default: returns 0 immediately after the message is enqueued and the
       dispatcher is (re)spawned (fire-and-forget), printing one receipt line
       naming the queued file:
-        paseo-queue: enqueued 2d4c857 pending/1787883101-0099103-0000.msg
+        paseo-queue: enqueued 2d4c857 (target: idle) pending/1787883101-0099103-0000.msg
+      The target's daemon-reported state is named because `enqueued` is a
+      statement about the SENDER's side only: correctly addressed and on
+      disk. A `closed` target additionally warns on stderr, since its
+      dispatcher will halt with halted-closed rather than deliver. Note Paseo
+      has no terminal state -- an agent that has FINISHED reports `idle`,
+      indistinguishable from one between turns -- so no warning is possible
+      for that case. The pending/ path is always the LAST field.
       Exit 0 there means ENQUEUED, not delivered; with --wait a second line
       reports delivery. --quiet suppresses both lines (errors still print).
       --wait: block until the message leaves pending/: exit 0 once it is
@@ -145,6 +152,7 @@ LS_JSON_OUT = b""
 LS_JSON_RC = 0
 LS_JSON_ROWS = []
 LAST_RESOLVE_RC = EXIT_RESOLUTION
+LAST_RESOLVE_STATUS = ""
 
 def die(message, code=EXIT_USAGE):
     sys.stderr.write("paseo-queue: %s\n" % message)
@@ -288,15 +296,23 @@ def snapshot_agents():
 
 
 def resolve_agent(query, allow_orphan=True):
-    """Resolve an agent by unique id prefix or exact name."""
-    global LAST_RESOLVE_RC
+    """Resolve an agent by unique id prefix or exact name.
+
+    Also records the matched agent's daemon-reported status in
+    LAST_RESOLVE_STATUS, so `add` can tell the sender what it just addressed
+    without paying for a second snapshot. Empty for an orphan, whose status
+    is by definition unknown.
+    """
+    global LAST_RESOLVE_RC, LAST_RESOLVE_STATUS
     LAST_RESOLVE_RC = EXIT_RESOLUTION
+    LAST_RESOLVE_STATUS = ""
     if fetch_ls_json() != 0:
         LAST_RESOLVE_RC = EXIT_DAEMON
         sys.stderr.write("paseo-queue: paseo ls --json failed (daemon unreachable?)\n")
         return None
 
     candidates = []
+    statuses = {}
     seen = set()
     for row in snapshot_agents():
         uuid = row.get("id", "")
@@ -308,10 +324,12 @@ def resolve_agent(query, allow_orphan=True):
         if (query and uuid.startswith(query)) or name == query:
             if uuid not in seen:
                 candidates.append((uuid, name))
+                statuses[uuid] = row.get("status", "")
                 seen.add(uuid)
 
     if len(candidates) == 1:
         LAST_RESOLVE_RC = 0
+        LAST_RESOLVE_STATUS = statuses.get(candidates[0][0], "")
         # This is a LIVE match, so the name in hand is authoritative. Refresh
         # the display cache that `ls` reads, so a rename converges as soon as
         # anything touches the agent. See refresh_agent_name.
@@ -1022,9 +1040,30 @@ def cmd_add(args):
         return die("add: failed to enqueue message: %s" % exc)
 
     short_id = uuid[:7]
+    # Name the target's state in the receipt. `enqueued` is a statement about
+    # the SENDER's side only -- the message is on disk and correctly addressed
+    # -- and says nothing about whether the target will run again to read it.
+    # The status was already fetched to resolve the agent, so this is free.
+    #
+    # Note what this can and cannot tell you. Paseo exposes closed/idle/
+    # running/error and has NO terminal state, so an agent that has finished
+    # its work is reported `idle`, indistinguishable from one between turns.
+    # A `closed` target, though, genuinely cannot read the message until it is
+    # revived, and that is worth saying out loud rather than leaving the
+    # sender to discover it later from `status`.
+    target_state = LAST_RESOLVE_STATUS or "unknown"
     if not quiet:
-        sys.stdout.write("paseo-queue: enqueued %s pending/%s\n" % (short_id, filename))
+        # Target state goes BEFORE the path so the pending/ filename stays the
+        # LAST field: t-18 parses it that way, and so can any caller doing
+        # `awk '{print $NF}'`. Appending would have silently broken both.
+        sys.stdout.write("paseo-queue: enqueued %s (target: %s) pending/%s\n"
+                         % (short_id, target_state, filename))
         sys.stdout.flush()
+    if target_state in ("closed", "error"):
+        sys.stderr.write(
+            "paseo-queue: WARN: %s is %s; this message stays queued until the "
+            "agent runs again. The dispatcher will halt with state "
+            "halted-closed rather than deliver it.\n" % (short_id, target_state))
     if interrupt:
         return deliver_interrupt(agent_dir, uuid, filename, quiet, short_id)
     if wait:
