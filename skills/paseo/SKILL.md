@@ -61,7 +61,7 @@ Agent-scoped `create_agent` defaults `notifyOnFinish` to true. Set it to `false`
 
 **`send_agent_prompt`** — `{ agentId, prompt }`. Use for an urgent follow-up important enough to interrupt an existing agent's current work. Agent-scoped prompt calls default to `background: true` and `notifyOnFinish: true`; top-level calls default to blocking with no callback. For a synchronous follow-up, pass `background: false` and use the returned result.
 
-**Coordination transport — choose by urgency.** Use the local `paseo-queue` CLI for routine and non-emergency prompts, regardless of whether the target appears busy: `paseo-queue add <agent> "msg"` is fire-and-forget FIFO, and `--wait` blocks until dispatch. The queue auto-delivers when the target is idle and has no pending permission, preserving ordering and permission holds. When a message genuinely warrants interrupting current work, use `paseo-queue add <agent> "msg" --interrupt`: it delivers immediately and records the send, so the message cannot later be re-delivered by a dispatcher. A bare `paseo send` or `send_agent_prompt` is invisible to the queue, so a message that was also queued will arrive twice; reserve those for cases where you are deliberately not queueing at all.
+**Coordination transport — choose by urgency.** Use the local `paseo-queue` CLI for routine and non-emergency prompts, regardless of whether the target appears busy: `paseo-queue add <agent> "msg"` is fire-and-forget FIFO, and `--wait` blocks until dispatch. The queue auto-delivers when the target is idle and has no pending permission, preserving ordering and permission holds. When a message genuinely warrants jumping the queue, use `paseo-queue add <agent> "msg" --priority`: it delivers immediately, arrives while the agent is still working, and records the send so it cannot later be re-delivered. When the agent must actually STOP, use `--interrupt`, which runs `paseo stop` first and therefore destroys whatever it was part-way through -- reserve that for stop orders and corrected premises. A bare `paseo send` or `send_agent_prompt` is invisible to the queue, so a message that was also queued will arrive twice.
 
 **`update_agent`** — `{ agentId, name?, labels?, settings? }`. Use `settings` for runtime changes on an existing agent: `modeId`, `model`, `thinkingOptionId`, and provider-specific `features`. For Codex fast mode, pass `settings: { features: { "fast_mode": true } }`.
 
@@ -121,7 +121,8 @@ paseo workspace create --isolation worktree --mode checkout-pr --pr-number 42
 paseo run --provider codex/gpt-5.4 --mode full-access --workspace <workspace-id> "<prompt>"
 paseo run --provider codex/gpt-5.4 --mode full-access --new-workspace worktree --worktree-mode branch-off --new-branch fix-x --base main "<prompt>"
 paseo-queue add <agent-id> "<routine follow-up>"
-paseo-queue add <agent-id> "<urgent interruption-worthy follow-up>" --interrupt
+paseo-queue add <agent-id> "<urgent follow-up, agent keeps working>" --priority
+paseo-queue add <agent-id> "<STOP: continuing would be wrong>" --interrupt
 paseo ls
 paseo schedule create --cron "*/15 * * * *" "ping main build"
 paseo heartbeat create --cron "*/15 * * * *" "check the build"

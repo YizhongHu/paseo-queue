@@ -1,6 +1,6 @@
 ---
 name: paseo-message-agent
-description: Coordinate with another Paseo-managed agent. Use `paseo-queue add` for routine or non-emergency reports, handoffs, policy updates, and follow-ups so FIFO ordering and permission holds are preserved. For messages important enough to interrupt, use `paseo-queue add --interrupt` rather than a bare `paseo send`: it delivers immediately and records the send, so the message cannot be delivered twice.
+description: Coordinate with another Paseo-managed agent. Use `paseo-queue add` for routine or non-emergency reports, handoffs, policy updates, and follow-ups so FIFO ordering and permission holds are preserved. For urgent messages use `paseo-queue add --priority`, which jumps the queue and arrives mid-work; reserve `add --interrupt` for cases where the agent must STOP, since it cancels its current turn and destroys unreported work. Prefer either over a bare `paseo send`, which the queue cannot see.
 ---
 
 # Paseo Message Agent
@@ -11,9 +11,14 @@ Choose transport by urgency:
 
 - For routine or non-emergency coordination, use `paseo-queue add <agent> "msg"`. This is the default even when the target might be idle; it preserves per-agent FIFO order and permission holds.
 - Add `--wait` only when the next step must block until dispatch. It confirms delivery to the agent, not completion of the requested work.
-- To interrupt, use `paseo-queue add <agent-id> "<message>" --interrupt`. It
-  delivers immediately, skipping the idle wait and the permission hold, and
-  files the message as sent so no dispatcher re-delivers it.
+- To jump the queue, use `paseo-queue add <agent-id> "<message>" --priority`.
+  It delivers immediately, skipping the idle wait and the permission hold, and
+  files the message as sent so no dispatcher re-delivers it. The agent receives
+  it mid-work and keeps going.
+- To make the agent STOP, use `--interrupt` instead. It runs `paseo stop`
+  first, so the agent's in-flight work is lost. Use it only when continuing
+  would be wrong -- a stop order, a correction to a premise it is acting on, a
+  revoked assumption. Not for routine status or "this is important".
 - Avoid a bare `paseo send` for content you would otherwise queue. The queue
   has no record of a direct send, so a message that was also queued gets
   delivered a second time later. Reach for `paseo send` only when you need
@@ -32,8 +37,9 @@ paseo-queue add <agent-id> "<message>" --wait
 Interruption-worthy path:
 
 ```bash
-paseo-queue add <agent-id> "<message>" --interrupt
-paseo-queue add <agent-id> --file /path/to/message.txt --interrupt
+paseo-queue add <agent-id> "<message>" --priority
+paseo-queue add <agent-id> --file /path/to/message.txt --priority
+paseo-queue add <agent-id> "STOP: <why continuing is wrong>" --interrupt
 ```
 
 `<agent-id>` may be a full ID or an accepted prefix. Multi-line text, including

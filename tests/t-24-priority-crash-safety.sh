@@ -6,13 +6,13 @@
 # dispatcher, so if anything dies the dispatcher still delivers. The interrupt
 # path deliberately does NOT spawn one up front, because it would race the
 # interrupt for the same file. That left a gap: a death between
-# INTERRUPT-BEGIN and the move into sent/ stranded the message in pending/
+# PRIORITY-BEGIN and the move into sent/ stranded the message in pending/
 # with nothing coming for it.
 #
 # Observed in the wild before the fix -- a real queue sat like this for 14
-# hours, with no INTERRUPT-OK and no INTERRUPT-FAIL ever logged:
+# hours, with no PRIORITY-OK and no PRIORITY-FAIL ever logged:
 #   ENQ             1788225629-0067910-0000.msg
-#   INTERRUPT-BEGIN 1788225629-0067910-0000.msg
+#   PRIORITY-BEGIN 1788225629-0067910-0000.msg
 #   (nothing)
 set -u
 
@@ -47,11 +47,11 @@ wait_for() {
 
 # --- kill the interrupt while it is inside the send ---------------------
 PATH="$SANDBOX/slowbin:$PATH" "$PQT_BIN" add "$AGENT_UUID" \
-    "interrupt that will be killed mid-send" --interrupt >/dev/null 2>&1 &
+    "interrupt that will be killed mid-send" --priority >/dev/null 2>&1 &
 t24_pid=$!
 
-wait_for 'grep -q INTERRUPT-BEGIN "'"$dp_dir"'/dispatch.log" 2>/dev/null' 20 \
-    || fail "the interrupt never reached INTERRUPT-BEGIN"
+wait_for 'grep -q PRIORITY-BEGIN "'"$dp_dir"'/dispatch.log" 2>/dev/null' 20 \
+    || fail "the interrupt never reached PRIORITY-BEGIN"
 
 kill -TERM "$t24_pid" 2>/dev/null
 wait "$t24_pid" 2>/dev/null
@@ -64,7 +64,7 @@ for t24_f in "$dp_dir/pending"/*.msg; do
 done
 assert_eq "$t24_pending" "1" "the killed interrupt should leave its message queued, not lost"
 
-assert_grep "$dp_dir/dispatch.log" "INTERRUPT-ABORT" \
+assert_grep "$dp_dir/dispatch.log" "PRIORITY-ABORT" \
     "an aborted interrupt should record that it was aborted"
 
 # THE POINT: a dispatcher must have been spawned to recover it. Without the

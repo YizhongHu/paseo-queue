@@ -12,7 +12,7 @@ enqueue order.
 This exists because Paseo has no built-in "deliver at the agent's next
 convenience" primitive. Routine prompts use this queue to preserve FIFO order
 and permission holds. When a message *is* urgent enough to interrupt, use
-`add --interrupt` rather than a bare `paseo send`: the queue performs the send
+`add --priority` (or `--interrupt`) rather than a bare `paseo send`: the queue performs the send
 itself, so the message is recorded and cannot later be delivered a second time
 by a dispatcher. `paseo wait` is a broadcast release shared by every waiter,
 not a queue.
@@ -66,11 +66,14 @@ When a message is important enough to interrupt the agent's current work,
 interrupt *through* the queue:
 
 ```sh
-paseo-queue add <agent> "urgent: stop before the deploy step" --interrupt
+paseo-queue add <agent> "new constraint before your next step" --priority
+paseo-queue add <agent> "STOP: do not merge, the ruling changed" --interrupt
 ```
 
-That delivers immediately — skipping both the wait for the agent to go idle
-and the pending-permission hold — and files the message in `sent/`.
+`--priority` jumps the queue and arrives mid-work; the agent carries on.
+`--interrupt` additionally runs `paseo stop`, cancelling whatever the agent
+was doing — use it only when continuing would be wrong, because unreported
+in-flight work is lost.
 
 Prefer it over a bare `paseo send`. A direct send happens outside the queue,
 so the queue has no record of it: if the same message was also queued, a
@@ -99,7 +102,7 @@ paseo-queue <subcommand> [args]
 
 ### Subcommands
 
-- **`add <agent> [text|--file <path>|stdin] [--wait] [--wait-timeout <seconds>] [--quiet] [--interrupt]`**
+- **`add <agent> [text|--file <path>|stdin] [--wait] [--wait-timeout <seconds>] [--quiet] [--priority] [--interrupt]`**
   Enqueue a message for delivery to `<agent>`. Message content comes from
   exactly one source: a single `[text]` argument, `--file <path>`, or piped
   stdin (mutually exclusive; if none is given and stdin is a tty, this is
@@ -125,26 +128,31 @@ paseo-queue <subcommand> [args]
   Exit `0` there means *enqueued*, not delivered; `--wait` adds a second
   line reporting delivery. `--quiet` suppresses both (errors still print).
 
-  `--interrupt` delivers that message immediately — skipping the wait for the
-  agent to become idle, the pending-permission hold, and any queued backlog —
-  and files it in `sent/`. It genuinely reaches a *running* agent: measured 6
-  seconds from send to the agent acknowledging it mid-work, 74 seconds before
-  its current task would have finished. The send passes `--no-wait`, so the
-  call returns once the daemon accepts the prompt rather than blocking until
-  the agent has processed it. Prefer it over a bare `paseo send` for anything you would otherwise
-  queue: the queue performs the send itself, so the message is recorded once
-  and no dispatcher can deliver it again. A direct `paseo send` is invisible to
-  the queue, so a message that was also queued arrives twice. `--interrupt`
-  jumps any backlog, which is why its receipt reads `interrupted` rather than
-  `delivered`; a failed immediate send leaves the message queued and exits
-  nonzero.
+  `--priority` **bumps the message to the front of the queue**: delivered
+  ahead of anything already queued for that agent, without waiting for the
+  agent to become idle and without waiting for a pending permission to clear,
+  then filed in `sent/`. The agent receives it **mid-work and carries on** —
+  nothing it is doing is cancelled. Measured 6 seconds from send to the agent
+  acknowledging it inside a running tool call. The send passes `--no-wait`, so
+  the call returns once the daemon accepts the prompt rather than blocking
+  until the agent has processed it. Receipt reads `prioritised`.
+
+  `--interrupt` **cancels the agent's current turn, then delivers.** It runs
+  `paseo stop` first, so whatever the agent was part-way through is **lost**,
+  including work it had not yet reported. Implies `--priority`. Reserve it for
+  messages where letting the agent continue would be *wrong* — a stop order, a
+  correction to a premise it is acting on, a revoked assumption — not for
+  routine status or "this is important". If the target was not running,
+  nothing is cancelled and the receipt says so. Receipt reads `interrupted`.
+
+  Prefer either over a bare `paseo send`, which is invisible to the queue: a
+  message that was also queued then arrives twice. A failed immediate send
+  leaves the message queued for normal delivery and exits nonzero.
 
   One semantic difference worth knowing: for a queued message, `sent/` means
   the receiving agent *processed* it, because the dispatcher waits for that.
-  For an `--interrupt` it means the daemon *accepted* it — delivery is prompt
-  but the caller does not wait for processing. That is the intended trade:
-  blocking an interrupt's sender for the recipient's thinking time is what
-  made interrupts look broken.
+  For `--priority`/`--interrupt` it means the daemon *accepted* it — delivery
+  is prompt but the caller does not wait for processing.
 
 - **`ls`**
   List every known agent's queue: pending/sent/failed counts and the
@@ -259,9 +267,10 @@ you actually read when diagnosing a delivery:
 | `SEND-BEGIN` / `SEND-OK` / `SEND-FAIL` | A normal queued delivery starting, succeeding (with byte count), or failing. |
 | `RETRY` | A transient send failure is being retried, with attempt count. |
 | `HALT` | The dispatcher stopped on a terminal condition — see the state file for which (`halted-closed`, `halted-failed`, `stalled-daemon`). |
-| `INTERRUPT-BEGIN` / `INTERRUPT-OK` / `INTERRUPT-FAIL` | An `add --interrupt` delivery. `INTERRUPT-OK` means the message was sent and filed in `sent/`, so no dispatcher will re-deliver it. `INTERRUPT-FAIL` means the message was left queued for normal delivery. |
-| `INTERRUPT-ABORT` | An `add --interrupt` was killed mid-delivery (SIGINT/SIGTERM). The message was left in `pending/` and a dispatcher was spawned to recover it, so it still gets delivered by the normal path. |
-| `INTERRUPT-RACE` | An `--interrupt` proceeded while a dispatcher was still inside a send for the same agent, after waiting `PASEO_QUEUE_INTERRUPT_GRACE` seconds. Two prompts may have reached the agent close together. |
+| `PRIORITY-BEGIN` / `PRIORITY-OK` / `PRIORITY-FAIL` | An `add --priority` or `add --interrupt` delivery. `PRIORITY-OK` means the message was sent and filed in `sent/`, so no dispatcher will re-deliver it. `PRIORITY-FAIL` means the message was left queued for normal delivery. |
+| `PRIORITY-ABORT` | An `add --priority`/`--interrupt` was killed mid-delivery (SIGINT/SIGTERM). The message was left in `pending/` and a dispatcher was spawned to recover it, so it still gets delivered by the normal path. |
+| `PREEMPT-STOP` | `add --interrupt` cancelling the target's turn before delivering, recording whether a running turn was actually cancelled. |
+| `PRIORITY-RACE` | An `--interrupt` proceeded while a dispatcher was still inside a send for the same agent, after waiting `PASEO_QUEUE_INTERRUPT_GRACE` seconds. Two prompts may have reached the agent close together. |
 | `CANCEL` | A pending message was removed by `rm`, or vanished before its send. |
 | `LINGER` / `REACQUIRE` / `YIELD` / `EXIT` | Dispatcher lifecycle: idling on an empty queue, resuming because work arrived, standing down because another dispatcher took the lock, and exiting (with a reason). |
 | `STOP` | A `stop` command SIGTERM'd this dispatcher, naming the pid. |
@@ -321,7 +330,7 @@ value below unless overridden.
 | `PASEO_QUEUE_WAIT_TIMEOUT`       | `60`                 | Timeout passed to the dispatcher's internal `paseo wait` call. |
 | `PASEO_QUEUE_MAX_BYTES`          | `262144`             | Max enqueued message size in bytes. |
 | `PASEO_QUEUE_WAIT_PROGRESS_EVERY`| `15`                 | Seconds between `add --wait` progress lines on stderr; `0` disables them. |
-| `PASEO_QUEUE_INTERRUPT_GRACE`    | `10`                 | Seconds `add --interrupt` waits for an in-flight dispatcher send before proceeding anyway. |
+| `PASEO_QUEUE_PRIORITY_GRACE`     | `10`                 | Seconds `add --interrupt` waits for an in-flight dispatcher send before proceeding anyway. |
 | `PASEO_QUEUE_LS_RETRY_DELAY`     | `0.5`                | Seconds to wait before retrying a failed `paseo ls --json` snapshot fetch. |
 | `PASEO_QUEUE_SEND_RETRIES`       | `5`                  | Transient send-failure retry count before a message is moved to `failed/`. |
 | `PASEO_QUEUE_DAEMON_RETRIES`     | `15`                 | Transient daemon-unreachable retry count before the dispatcher halts as `stalled-daemon`. |

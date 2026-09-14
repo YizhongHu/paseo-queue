@@ -1,5 +1,5 @@
 #!/bin/sh
-# tests/t-22-interrupt-send.sh: `add --interrupt` delivers now, bypassing the
+# tests/t-22-interrupt-send.sh: `add --priority` delivers now, bypassing the
 # idle/permission gate, and the message must never be delivered a SECOND time.
 #
 # Why this exists. The documented way to interrupt an agent was a bare
@@ -33,13 +33,13 @@ mock_send_count() {
 
 # --- interrupt delivers to a BUSY agent ---------------------------------
 PASEO_QUEUE_NO_SPAWN=1 "$PQT_BIN" add "$AGENT_UUID" "urgent while busy" \
-    --interrupt >"$SANDBOX/int.out" 2>"$SANDBOX/int.err"
-assert_rc 0 "$?" "--interrupt should deliver even though the agent is busy"
+    --priority >"$SANDBOX/int.out" 2>"$SANDBOX/int.err"
+assert_rc 0 "$?" "--priority should deliver even though the agent is busy"
 
 assert_grep "$SANDBOX/int.out" "^paseo-queue: enqueued a000002 (target: [a-z]*) pending/" \
-    "--interrupt should still print the enqueue receipt"
-assert_grep "$SANDBOX/int.out" "^paseo-queue: interrupted a000002 " \
-    "--interrupt should report the interrupt, not a normal delivery"
+    "--priority should still print the enqueue receipt"
+assert_grep "$SANDBOX/int.out" "^paseo-queue: prioritised a000002 " \
+    "--priority should report the interrupt, not a normal delivery"
 
 assert_eq "$(mock_send_count)" "1" "the message should have been sent exactly once"
 
@@ -60,7 +60,7 @@ for t22_f in "$dp_dir/sent"/*.msg; do
 done
 assert_eq "$t22_sent" "1" "the interrupted message must be filed in sent/"
 
-assert_grep "$dp_dir/dispatch.log" "INTERRUPT-OK msg=$t22_name" \
+assert_grep "$dp_dir/dispatch.log" "PRIORITY-OK msg=$t22_name" \
     "the interrupt should be recorded in the dispatch log"
 
 # --- THE POINT: a dispatcher must not re-deliver it ---------------------
@@ -71,16 +71,16 @@ assert_eq "$(mock_send_count)" "1" \
 
 # --- --quiet silences the receipts, both streams -----------------------
 PASEO_QUEUE_NO_SPAWN=1 "$PQT_BIN" add "$AGENT_UUID" "quiet interrupt" \
-    --interrupt --quiet >"$SANDBOX/q.out" 2>"$SANDBOX/q.err"
-assert_rc 0 "$?" "--interrupt --quiet should succeed"
-[ ! -s "$SANDBOX/q.out" ] || fail "--interrupt --quiet must print nothing on stdout"
-[ ! -s "$SANDBOX/q.err" ] || fail "--interrupt --quiet must print nothing on stderr"
+    --priority --quiet >"$SANDBOX/q.out" 2>"$SANDBOX/q.err"
+assert_rc 0 "$?" "--priority --quiet should succeed"
+[ ! -s "$SANDBOX/q.out" ] || fail "--priority --quiet must print nothing on stdout"
+[ ! -s "$SANDBOX/q.err" ] || fail "--priority --quiet must print nothing on stderr"
 assert_eq "$(mock_send_count)" "2" "the quiet interrupt should also have sent"
 
-# --- --interrupt with --wait is rejected, not silently ignored ---------
-PASEO_QUEUE_NO_SPAWN=1 "$PQT_BIN" add "$AGENT_UUID" "both" --interrupt --wait \
+# --- --priority with --wait is rejected, not silently ignored ---------
+PASEO_QUEUE_NO_SPAWN=1 "$PQT_BIN" add "$AGENT_UUID" "both" --priority --wait \
     >/dev/null 2>"$SANDBOX/both.err"
-assert_rc 1 "$?" "--interrupt with --wait should be rejected"
+assert_rc 1 "$?" "--priority with --wait should be rejected"
 assert_grep "$SANDBOX/both.err" "redundant" \
     "the rejection should explain that --wait adds nothing to an interrupt"
 
@@ -88,11 +88,11 @@ assert_grep "$SANDBOX/both.err" "redundant" \
 mock_set_send_script "rc=1 err=interrupt-boom"
 
 PASEO_QUEUE_NO_SPAWN=1 "$PQT_BIN" add "$AGENT_UUID" "will fail to interrupt" \
-    --interrupt >"$SANDBOX/fail.out" 2>"$SANDBOX/fail.err"
+    --priority >"$SANDBOX/fail.out" 2>"$SANDBOX/fail.err"
 assert_rc 1 "$?" "a failed interrupt must exit non-zero: the caller did not get immediacy"
 assert_grep "$SANDBOX/fail.err" "message stays queued for normal delivery" \
     "a failed interrupt should say the message is still queued"
-assert_grep "$dp_dir/dispatch.log" "INTERRUPT-FAIL" \
+assert_grep "$dp_dir/dispatch.log" "PRIORITY-FAIL" \
     "a failed interrupt should be recorded in the dispatch log"
 
 t22_pending_after=0

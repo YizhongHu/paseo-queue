@@ -18,7 +18,7 @@ USAGE = """Usage: paseo-queue <subcommand> [args]
 
 Subcommands:
   add <agent> [text|--file <path>|stdin] [--wait] [--wait-timeout <seconds>]
-      [--quiet] [--interrupt]
+      [--quiet] [--priority] [--interrupt]
       Enqueue a message for delivery to <agent>. Message content comes from
       exactly one source: a single [text] argument, --file <path>, or piped
       stdin (mutually exclusive; with none given and stdin is a tty, this
@@ -51,20 +51,25 @@ Subcommands:
       doing -- expect long waits, since delivery is FIFO per agent and a
       `paseo send` blocks until the agent has PROCESSED the prompt (median
       ~57s, minutes at p90). --quiet suppresses progress but not errors.
-      --interrupt: deliver THIS message NOW, bypassing the wait for the agent
-      to become idle, the pending-permission hold, and any queued backlog,
-      then file it in sent/. `paseo send` does genuinely interrupt a running
-      agent: measured 6s from send to the agent acknowledging it mid-work.
-      The send uses --no-wait, so this returns once the daemon has accepted
-      the prompt rather than blocking until the agent has finished processing
-      it -- without that, an interrupt that landed in seconds did not return
-      for minutes and looked to its sender like a failure. Prefer it over a bare `paseo send` for anything you would
-      otherwise queue: the queue performs the send itself, so the message is
-      recorded and no dispatcher can ever deliver it a second time. It also
-      jumps any queued backlog, which is why its receipt reads "interrupted"
-      rather than "delivered". If the immediate send fails the message stays
-      queued for normal delivery and the exit status is nonzero. Cannot be
-      combined with --wait, which would have nothing left to wait for.
+      --priority: BUMP TO THE FRONT OF THE QUEUE. Delivers this message
+      ahead of anything already queued for that agent, without waiting for
+      the agent to go idle and without waiting for a pending permission to
+      clear, then files it in sent/. The agent receives it MID-WORK and
+      CARRIES ON -- nothing it is doing is cancelled. Measured 6s from send
+      to the agent acknowledging it inside a running tool call. The send
+      uses --no-wait, so this returns once the daemon accepts the prompt
+      rather than blocking until the agent has processed it.
+      --interrupt: CANCEL THE AGENT'S CURRENT TURN, then deliver. Runs
+      `paseo stop` first, so whatever the agent was part-way through is
+      LOST, including work it had not yet reported. Implies --priority.
+      Reserve it for messages where letting the agent continue would be
+      WRONG -- a stop order, a correction, a revoked assumption -- not for
+      routine status, acks or completions. If the target was not running,
+      nothing is cancelled and the receipt says so.
+      Neither flag can be combined with --wait, which would have nothing
+      left to wait for. Prefer either over a bare `paseo send`: the queue
+      performs the send itself, so the message is recorded and no dispatcher
+      can deliver it a second time.
 
   ls
       List every known agent's queue: pending/sent/failed counts and the
@@ -129,7 +134,7 @@ Environment knobs (all test-overridable):
   PASEO_QUEUE_NO_SPAWN          Set to 1 to disable dispatcher auto-spawn (tests only)
   PASEO_QUEUE_BACKOFF_SCALE     Multiplier for _dispatch backoff sleeps, nonnegative
                                 integer (default: 1; tests only)
-  PASEO_QUEUE_INTERRUPT_GRACE   Seconds add --interrupt waits for an in-flight
+  PASEO_QUEUE_PRIORITY_GRACE   Seconds add --interrupt waits for an in-flight
                                 dispatcher send before proceeding (default: 10)
   PASEO_QUEUE_WAIT_PROGRESS_EVERY  Seconds between add --wait progress lines
                                 (default: 15; 0 disables)
@@ -736,7 +741,8 @@ def parse_add(args):
     wait = False
     timeout = None
     quiet = False
-    interrupt = False
+    priority = False
+    preempt = False
     positional = []
     index = 0
     literal = False
@@ -757,8 +763,13 @@ def parse_add(args):
             wait = True
         elif token == "--quiet":
             quiet = True
+        elif token == "--priority":
+            priority = True
         elif token == "--interrupt":
-            interrupt = True
+            # The stronger form: cancels the current turn first. Implies the
+            # immediate delivery that --priority does.
+            preempt = True
+            priority = True
         elif token == "--wait-timeout":
             if index >= len(tokens):
                 return None, die("add: --wait-timeout requires a value in seconds")
@@ -782,13 +793,13 @@ def parse_add(args):
     # --interrupt delivers before returning, so there is nothing left for
     # --wait to wait for. Accepting both would let a caller believe the wait
     # meant something.
-    if interrupt and wait:
-        return None, die("add: --interrupt already delivers before returning; --wait/--wait-timeout is redundant")
+    if priority and wait:
+        return None, die("add: --priority/--interrupt already deliver before returning; --wait/--wait-timeout is redundant")
     if text is None and file_path is None:
         if sys.stdin.isatty():
             return None, die("add: no message given (pass text, --file <path>, or pipe stdin)")
-        return (agent_query, text, file_path, wait, timeout, quiet, True, interrupt), 0
-    return (agent_query, text, file_path, wait, timeout, quiet, False, interrupt), 0
+        return (agent_query, text, file_path, wait, timeout, quiet, True, priority, preempt), 0
+    return (agent_query, text, file_path, wait, timeout, quiet, False, priority, preempt), 0
 
 
 def read_state(agent_dir):
@@ -799,7 +810,8 @@ def read_state(agent_dir):
         return ""
 
 
-def deliver_interrupt(agent_dir, uuid, filename, quiet, short_id):
+def deliver_priority(agent_dir, uuid, filename, quiet, short_id,
+                     preempt=False):
     """Deliver one message NOW, bypassing the idle/permission gate.
 
     This exists to remove a duplicate-delivery trap. The documented way to
@@ -825,21 +837,21 @@ def deliver_interrupt(agent_dir, uuid, filename, quiet, short_id):
     # an idle dispatcher. The state file marks the actual send window, so wait
     # only for that, briefly, and proceed regardless -- an interrupt that
     # silently becomes a queued message is worse than a warned-about race.
-    grace = env_int("PASEO_QUEUE_INTERRUPT_GRACE", 10)
+    grace = env_int("PASEO_QUEUE_PRIORITY_GRACE", 10)
     waited = 0
     while read_state(agent_dir) == "sending" and waited < grace:
         time.sleep(1)
         waited += 1
     raced = read_state(agent_dir) == "sending"
     if raced:
-        log_line(agent_dir, "INTERRUPT-RACE",
+        log_line(agent_dir, "PRIORITY-RACE",
                  "msg=%s dispatcher still sending after %ss" % (filename, grace))
         sys.stderr.write("paseo-queue: add --interrupt: a dispatcher is still "
                          "sending for %s; delivering anyway (possible "
                          "concurrent prompt)\n" % short_id)
 
-    log_line(agent_dir, "INTERRUPT-BEGIN", filename)
-    stderr_path = os.path.join(agent_dir, "tmp", "interrupt.%d" % os.getpid())
+    log_line(agent_dir, "PRIORITY-BEGIN", filename)
+    stderr_path = os.path.join(agent_dir, "tmp", "priority.%d" % os.getpid())
 
     # CRASH SAFETY. The normal enqueue path is recoverable by construction:
     # `add` spawns a dispatcher, so if anything dies the dispatcher still
@@ -864,10 +876,10 @@ def deliver_interrupt(agent_dir, uuid, filename, quiet, short_id):
     signal.signal(signal.SIGINT, _interrupt_bail)
     signal.signal(signal.SIGTERM, _interrupt_bail)
     try:
-        return _deliver_interrupt_send(agent_dir, uuid, filename, quiet,
-                                       short_id, path, stderr_path)
+        return _deliver_priority_send(agent_dir, uuid, filename, quiet,
+                                      short_id, path, stderr_path, preempt)
     except (KeyboardInterrupt, SystemExit):
-        log_line(agent_dir, "INTERRUPT-ABORT",
+        log_line(agent_dir, "PRIORITY-ABORT",
                  "msg=%s aborted mid-delivery; leaving it queued" % filename)
         raise
     finally:
@@ -887,9 +899,38 @@ def deliver_interrupt(agent_dir, uuid, filename, quiet, short_id):
             spawn_dispatcher(uuid)
 
 
-def _deliver_interrupt_send(agent_dir, uuid, filename, quiet, short_id, path,
-                            stderr_path):
-    """The send itself. Wrapped by deliver_interrupt for crash safety."""
+def _deliver_priority_send(agent_dir, uuid, filename, quiet, short_id, path,
+                           stderr_path, preempt=False):
+    """The send itself. Wrapped by deliver_priority for crash safety.
+
+    With preempt=True (`add --interrupt`) the agent's current turn is
+    CANCELLED before the send. That is destructive: whatever it was part-way
+    through is lost, including work it had not yet reported. It is the whole
+    difference from --priority, which arrives mid-turn and lets the agent
+    carry on.
+    """
+    if preempt:
+        # `paseo stop` exits 0 even for an agent that does not exist, so its
+        # exit status cannot answer "was a turn actually cancelled". The
+        # resolved status can, and resolve_agent already recorded it.
+        was_running = (LAST_RESOLVE_STATUS == "running")
+        try:
+            subprocess.call(["paseo", "stop", uuid],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+        except (IOError, OSError):
+            pass
+        log_line(agent_dir, "PREEMPT-STOP",
+                 "%s target_was=%s (%s)"
+                 % (filename, LAST_RESOLVE_STATUS or "unknown",
+                    "turn cancelled" if was_running
+                    else "nothing running to cancel"))
+        if not quiet:
+            sys.stderr.write(
+                "paseo-queue: add --interrupt: %s %s\n"
+                % (short_id,
+                   "running turn cancelled before delivery" if was_running
+                   else "had no running turn to cancel"))
     try:
         with open(stderr_path, "wb") as stderr_stream:
             # --no-wait: return once the daemon has ACCEPTED the prompt,
@@ -916,19 +957,20 @@ def _deliver_interrupt_send(agent_dir, uuid, filename, quiet, short_id, path,
             byte_count = os.path.getsize(path)
             os.replace(path, os.path.join(agent_dir, "sent", filename))
         except OSError as exc:
-            log_line(agent_dir, "INTERRUPT-FAIL",
+            log_line(agent_dir, "PRIORITY-FAIL",
                      "msg=%s error=%s" % (filename, exc))
-            return die("add --interrupt: delivered but could not file the "
+            return die("add --priority: delivered but could not file the "
                        "message as sent (%s); it may be delivered again" % exc)
-        log_line(agent_dir, "INTERRUPT-OK",
+        log_line(agent_dir, "PRIORITY-OK",
                  "msg=%s bytes=%s" % (filename, byte_count))
         try:
             os.unlink(stderr_path)
         except OSError:
             pass
         if not quiet:
-            sys.stdout.write("paseo-queue: interrupted %s %s\n"
-                             % (short_id, filename))
+            sys.stdout.write("paseo-queue: %s %s %s\n"
+                             % ("interrupted" if preempt else "prioritised",
+                                short_id, filename))
         return 0
 
     # Failed to interrupt. Leave the message in pending/ and hand it to a
@@ -942,9 +984,9 @@ def _deliver_interrupt_send(agent_dir, uuid, filename, quiet, short_id, path,
             tail = tail[0] if tail else ""
     except (IOError, OSError, IndexError):
         tail = ""
-    log_line(agent_dir, "INTERRUPT-FAIL",
+    log_line(agent_dir, "PRIORITY-FAIL",
              "msg=%s rc=%s %s" % (filename, send_rc, tail))
-    return die("add --interrupt: immediate send failed (rc=%s); message stays "
+    return die("add --priority: immediate send failed (rc=%s); message stays "
                "queued for normal delivery%s"
                % (send_rc, (": " + tail) if tail else ""))
 
@@ -977,7 +1019,7 @@ def cmd_add(args):
     parsed, code = parse_add(args)
     if code:
         return code
-    agent_query, text, file_path, wait, timeout, quiet, use_stdin, interrupt = parsed
+    agent_query, text, file_path, wait, timeout, quiet, use_stdin, priority, preempt = parsed
     resolved = resolve_agent(agent_query, allow_orphan=False)
     if resolved is None:
         return LAST_RESOLVE_RC
@@ -1030,7 +1072,7 @@ def cmd_add(args):
         # a dispatcher here: that dispatcher would race it for the same file.
         # If the interrupt send fails, deliver_interrupt spawns one so the
         # message degrades to an ordinary queued message rather than sitting.
-        if not interrupt:
+        if not priority:
             spawn_dispatcher(uuid)
     except (IOError, OSError, RuntimeError) as exc:
         try:
@@ -1064,8 +1106,9 @@ def cmd_add(args):
             "paseo-queue: WARN: %s is %s; this message stays queued until the "
             "agent runs again. The dispatcher will halt with state "
             "halted-closed rather than deliver it.\n" % (short_id, target_state))
-    if interrupt:
-        return deliver_interrupt(agent_dir, uuid, filename, quiet, short_id)
+    if priority:
+        return deliver_priority(agent_dir, uuid, filename, quiet, short_id,
+                                preempt)
     if wait:
         return wait_for_delivery(agent_dir, filename,
                                  int(timeout) if timeout is not None else None,

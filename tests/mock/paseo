@@ -396,6 +396,16 @@ case "$mock_cmd" in
         mock_send "$@"
         exit $?
         ;;
+    stop)
+        # `add --interrupt` cancels the target's turn before sending. The real
+        # CLI exits 0 even for an unknown agent, so this mirrors that rather
+        # than reporting a useful status: the invocation itself is the
+        # observable, recorded in calls.log by log_call above.
+        if [ -n "${1:-}" ]; then
+            mock_set_status "$1" idle 2>/dev/null || :
+        fi
+        exit 0
+        ;;
     *)
         echo "paseo: mock: unknown or unsupported subcommand: $mock_cmd" >&2
         exit 1
