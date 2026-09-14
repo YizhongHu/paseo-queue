@@ -31,15 +31,17 @@ assert_rc 0 "$?" "add should succeed"
 
 [ -s "$SANDBOX/add.out" ] || fail "successful add must print a receipt on stdout, not stay silent"
 [ ! -s "$SANDBOX/add.err" ] || fail "successful add must keep stderr empty (got: $(cat "$SANDBOX/add.err"))"
-assert_grep "$SANDBOX/add.out" "^paseo-queue: enqueued $AGENT_SHORT pending/" \
-    "receipt should name the agent short id and the pending/ path"
+assert_grep "$SANDBOX/add.out" "^paseo-queue: enqueued $AGENT_SHORT (target: [a-z]*) pending/" \
+    "receipt should name the agent short id, the target state, and the pending/ path"
 
 t18_lines="$(wc -l < "$SANDBOX/add.out" | tr -d ' ')"
 assert_eq "$t18_lines" "1" "a plain add should print exactly one receipt line"
 
 # The receipt must name the file that actually exists -- a receipt naming a
 # path the caller cannot then inspect would be worse than silence.
-t18_named="$(sed -n 's|^paseo-queue: enqueued [^ ]* pending/\(.*\)$|\1|p' "$SANDBOX/add.out")"
+# The pending/ path is deliberately the LAST field so it stays
+# extractable with $NF even as annotations are added before it.
+t18_named="$(sed -n 's|^paseo-queue: enqueued .* pending/\(.*\)$|\1|p' "$SANDBOX/add.out")"
 [ -n "$t18_named" ] || fail "could not parse the message name out of the receipt"
 [ -e "$dp_dir/pending/$t18_named" ] \
     || fail "receipt names pending/$t18_named but no such file exists"
@@ -82,7 +84,7 @@ t18_waitpid=$!
 wait "$t18_waitpid"
 assert_rc 0 "$?" "add --wait should exit 0 once the message is delivered"
 
-assert_grep "$SANDBOX/wait.out" "^paseo-queue: enqueued $AGENT_SHORT pending/" \
+assert_grep "$SANDBOX/wait.out" "^paseo-queue: enqueued $AGENT_SHORT (target: [a-z]*) pending/" \
     "--wait should still print the enqueue receipt"
 assert_grep "$SANDBOX/wait.out" "^paseo-queue: delivered $AGENT_SHORT " \
     "--wait should report delivery, since a bare exit 0 only means enqueued"

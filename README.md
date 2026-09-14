@@ -111,8 +111,17 @@ paseo-queue <subcommand> [args]
   On success it prints one receipt line naming the queued file, so a caller
   has a concrete artefact to check rather than only the absence of an error:
   ```
-  paseo-queue: enqueued 2d4c857 pending/1787883101-0099103-0000.msg
+  paseo-queue: enqueued 2d4c857 (target: idle) pending/1787883101-0099103-0000.msg
   ```
+  The target's daemon-reported state is included because `enqueued` otherwise
+  says only that *your* side succeeded — the message is on disk and correctly
+  addressed — and nothing about whether the recipient will run again to read
+  it. A `closed` target also warns on stderr, because its dispatcher will halt
+  with `halted-closed` rather than deliver. Paseo has no *terminal* state, so
+  an agent that has finished its work reports `idle`, indistinguishable from
+  one merely between turns; that case cannot be warned about because the
+  daemon does not know either. The `pending/` path is always the **last
+  field**, so `awk '{print $NF}'` keeps working as annotations are added.
   Exit `0` there means *enqueued*, not delivered; `--wait` adds a second
   line reporting delivery. `--quiet` suppresses both (errors still print).
 
