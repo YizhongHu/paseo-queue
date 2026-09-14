@@ -114,7 +114,7 @@ paseo-queue <subcommand> [args]
   On success it prints one receipt line naming the queued file, so a caller
   has a concrete artefact to check rather than only the absence of an error:
   ```
-  paseo-queue: enqueued 2d4c857 (target: idle) pending/1787883101-0099103-0000.msg
+  paseo-queue: enqueued 2d4c857 (target: idle, 2 ahead) pending/1787883101-...msg
   ```
   The target's daemon-reported state is included because `enqueued` otherwise
   says only that *your* side succeeded — the message is on disk and correctly
@@ -123,8 +123,11 @@ paseo-queue <subcommand> [args]
   with `halted-closed` rather than deliver. Paseo has no *terminal* state, so
   an agent that has finished its work reports `idle`, indistinguishable from
   one merely between turns; that case cannot be warned about because the
-  daemon does not know either. The `pending/` path is always the **last
-  field**, so `awk '{print $NF}'` keeps working as annotations are added.
+  daemon does not know either. The receipt also reports how many messages sort **ahead** of yours, so you
+  can see where it landed without running `ls`; that is omitted for
+  `--priority`/`--interrupt`, which jump the backlog. The `pending/` path is
+  always the **last field**, so `awk '{print $NF}'` keeps working as
+  annotations are added.
   Exit `0` there means *enqueued*, not delivered; `--wait` adds a second
   line reporting delivery. `--quiet` suppresses both (errors still print).
 
@@ -144,6 +147,11 @@ paseo-queue <subcommand> [args]
   correction to a premise it is acting on, a revoked assumption — not for
   routine status or "this is important". If the target was not running,
   nothing is cancelled and the receipt says so. Receipt reads `interrupted`.
+
+  `--priority` and `--interrupt` are **mutually exclusive** — state one
+  intent. `--priority` is also how you *steer* an agent: it reads the message
+  while still working and adjusts, without losing context. Paseo offers no
+  primitive between "send" and "stop", so there is no separate steer mode.
 
   Prefer either over a bare `paseo send`, which is invisible to the queue: a
   message that was also queued then arrives twice. A failed immediate send
