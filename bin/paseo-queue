@@ -57,11 +57,18 @@ Subcommands:
       --priority: BUMP TO THE FRONT OF THE QUEUE. Delivers this message
       ahead of anything already queued for that agent, without waiting for
       the agent to go idle and without waiting for a pending permission to
-      clear, then files it in sent/. The agent receives it MID-WORK and
-      CARRIES ON -- nothing it is doing is cancelled. Measured 6s from send
-      to the agent acknowledging it inside a running tool call. The send
-      uses --no-wait, so this returns once the daemon accepts the prompt
-      rather than blocking until the agent has processed it.
+      clear, then files it in sent/. It reaches the agent MID-WORK, within
+      seconds. BE AWARE THIS IS NOT FREE: arriving mid-work CANCELS the
+      agent's in-flight tool call. Measured by having an agent run a
+      100-second shell loop appending a timestamp every 5s and sending at
+      t+13s -- the file froze at 3 lines, never reached its end marker, and
+      the agent reported "tool got rejected". The agent keeps its turn and
+      its context and can retry, but a long build, test run or job
+      submission in progress WILL be cut short. There is no way to insert a
+      message at the agent's next convenience; Paseo has no primitive
+      between send and stop. The send uses --no-wait, so this returns once
+      the daemon accepts the prompt rather than blocking until the agent has
+      processed it.
       --interrupt: CANCEL THE AGENT'S CURRENT TURN, then deliver. Runs
       `paseo stop` first, so whatever the agent was part-way through is
       LOST, including work it had not yet reported. Implies --priority.

@@ -13,8 +13,10 @@ Choose transport by urgency:
 - Add `--wait` only when the next step must block until dispatch. It confirms delivery to the agent, not completion of the requested work.
 - To jump the queue, use `paseo-queue add <agent-id> "<message>" --priority`.
   It delivers immediately, skipping the idle wait and the permission hold, and
-  files the message as sent so no dispatcher re-delivers it. The agent receives
-  it mid-work and keeps going.
+  files the message as sent so no dispatcher re-delivers it. It reaches the
+  agent mid-work -- which CANCELS its in-flight tool call. The agent keeps its
+  turn and context and can retry, but a long command in progress is cut short,
+  so this is not a free action.
 - To make the agent STOP, use `--interrupt` instead. It runs `paseo stop`
   first, so the agent's in-flight work is lost. Use it only when continuing
   would be wrong -- a stop order, a correction to a premise it is acting on, a

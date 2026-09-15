@@ -1,6 +1,6 @@
 ---
 name: paseo-queue
-description: Queue prompts to Paseo agents for ordered FIFO delivery with permission holds. Answer two independent questions per message. Urgency: no flag (routine), `--priority` (jump the queue, arrive mid-work, agent carries on -- also how you steer), `--interrupt` (cancel its current turn; destructive; mutually exclusive with --priority). Blocking: default returns at once, `--wait` blocks with no deadline, `--wait-timeout N` is bounded. Prefer all of these over a bare `paseo send`, which the queue cannot see and which risks a duplicate delivery.
+description: Queue prompts to Paseo agents for ordered FIFO delivery with permission holds. Answer two independent questions per message. Urgency: no flag (routine), `--priority` (jump the queue, arrive mid-work -- this CANCELS the agent's in-flight tool call, though its turn and context survive; the closest thing to steering), `--interrupt` (cancel its current turn; destructive; mutually exclusive with --priority). Blocking: default returns at once, `--wait` blocks with no deadline, `--wait-timeout N` is bounded. Prefer all of these over a bare `paseo send`, which the queue cannot see and which risks a duplicate delivery.
 ---
 
 ## Why
@@ -19,7 +19,7 @@ Every `add` answers two questions. They are independent -- answer both.
 | | flag | meaning |
 |---|---|---|
 | not urgent | *(none)* | delivered FIFO once the agent is idle with no pending permission |
-| urgent, but the agent's current work is still valid | `--priority` | jumps the backlog, arrives MID-WORK, agent carries on |
+| urgent, and the agent's next step should change | `--priority` | jumps the backlog, arrives MID-WORK; CANCELS its in-flight tool call, turn and context survive |
 | urgent, and the agent must STOP | `--interrupt` | runs `paseo stop` first; unreported in-flight work is LOST |
 
 `--priority` and `--interrupt` are **mutually exclusive** -- state one intent.
@@ -29,11 +29,17 @@ Pick by consequence, not by how important the message feels:
 - **no flag** unless you can name a concrete harm from waiting. Status,
   acknowledgements, completions, handoffs, non-blocking questions. Correct
   even when the target looks busy or idle; a dispatcher is watching for you.
-- **`--priority`** when the message changes what the agent should do NEXT but
-  its current step is still valid: a new constraint, a corrected path, a
-  heads-up it needs before its next decision. Also when a backlog would delay
-  it unacceptably. This is also how you STEER an agent -- it reads the message
-  while still working and adjusts, without losing its context.
+- **`--priority`** when the message changes what the agent should do NEXT: a
+  new constraint, a corrected path, a heads-up it needs before its next
+  decision. Also when a backlog would delay it unacceptably.
+  NOT FREE: arriving mid-work CANCELS the agent's in-flight tool call. The
+  agent keeps its turn and its context and can retry, so no reasoning is lost
+  -- but a running build, test suite or job submission is cut short. Measured:
+  an agent running a 100-second loop stopped writing after 13 seconds when a
+  --priority message landed, and reported "tool got rejected".
+  This is the closest thing to STEERING available. There is NO option that
+  inserts at the agent's next convenience -- Paseo has no primitive between
+  `send` and `stop`, so every urgent path costs something.
 - **`--interrupt`** only when letting it continue would be actively WRONG: a
   stop order ("do not merge", "halt the run"), a correction to a premise it is
   acting on, a revoked assumption or assignment, or it is working on the wrong
@@ -86,9 +92,11 @@ way to see that coming.
   queued ahead of yours. Pass `--wait-timeout <seconds>` if you cannot afford
   that, and treat exit 4 as "still queued", not "failed".
 - `paseo-queue add <agent> "text" --priority` — jump to the front of the
-  queue and deliver now, bypassing the idle wait and the permission hold. The
-  agent receives it mid-work and carries on. Receipt reads `prioritised`. A
-  failed send leaves the message queued and exits nonzero.
+  queue and deliver now, bypassing the idle wait and the permission hold. It
+  reaches the agent mid-work, which CANCELS its in-flight tool call; the turn
+  and context survive and it can retry, but a long command is cut short.
+  Receipt reads `prioritised`. A failed send leaves the message queued and
+  exits nonzero.
 - `paseo-queue add <agent> "text" --interrupt` — CANCEL the agent's current
   turn (`paseo stop`), then deliver. Destructive: unreported in-flight work is
   lost. Implies `--priority`. Receipt reads `interrupted`, and it tells you
