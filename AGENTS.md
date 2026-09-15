@@ -18,6 +18,17 @@
   `start_new_session=True`. Inheriting the caller's process group is what
   caused issue #4: short-lived agent shells took their dispatchers down with
   them and stranded messages silently for ~21 hours.
+- **Neither urgent path is free, and the docs must never imply otherwise.**
+  `paseo send` to a running agent CANCELS its in-flight tool call. Measured:
+  an agent running a 100-second shell loop that appended a timestamp every 5
+  seconds stopped writing when a message arrived at t+13s, never reached its
+  end marker, and reported "tool got rejected". The agent keeps its turn and
+  context and can retry, so reasoning is not lost, but a build, test run or
+  job submission in flight dies. There is NO primitive that inserts at the
+  agent's next convenience -- `paseo` offers `send` and `stop` and nothing
+  between them. Documentation previously claimed --priority left the agent
+  "carrying on, nothing cancelled"; that was inferred from a caller-side
+  measurement and was wrong in the dangerous direction.
 - **`--priority` and `--interrupt` are different promises.** `--priority`
   jumps the queue and arrives mid-work, leaving the agent running.
   `--interrupt` additionally runs `paseo stop`, cancelling the current turn

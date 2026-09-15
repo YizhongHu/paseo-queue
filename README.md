@@ -70,7 +70,8 @@ paseo-queue add <agent> "new constraint before your next step" --priority
 paseo-queue add <agent> "STOP: do not merge, the ruling changed" --interrupt
 ```
 
-`--priority` jumps the queue and arrives mid-work; the agent carries on.
+`--priority` jumps the queue and arrives mid-work, cancelling whatever tool
+call the agent has in flight; it keeps its turn and context.
 `--interrupt` additionally runs `paseo stop`, cancelling whatever the agent
 was doing — use it only when continuing would be wrong, because unreported
 in-flight work is lost.
@@ -134,9 +135,16 @@ paseo-queue <subcommand> [args]
   `--priority` **bumps the message to the front of the queue**: delivered
   ahead of anything already queued for that agent, without waiting for the
   agent to become idle and without waiting for a pending permission to clear,
-  then filed in `sent/`. The agent receives it **mid-work and carries on** —
-  nothing it is doing is cancelled. Measured 6 seconds from send to the agent
-  acknowledging it inside a running tool call. The send passes `--no-wait`, so
+  then filed in `sent/`. It reaches the agent **mid-work**, within seconds.
+
+  **This is not free: arriving mid-work cancels the agent's in-flight tool
+  call.** Measured directly — an agent ran a 100-second shell loop appending a
+  timestamp every 5 seconds; a message sent at t+13s froze the file at 3 lines,
+  it never reached its end marker, and the agent reported *"tool got
+  rejected"*. The agent keeps its turn and its context and can retry, but a
+  long build, test run, or job submission in flight **will be cut short**.
+  There is no way to insert a message at the agent's next convenience: Paseo
+  has no primitive between `send` and `stop`. The send passes `--no-wait`, so
   the call returns once the daemon accepts the prompt rather than blocking
   until the agent has processed it. Receipt reads `prioritised`.
 
