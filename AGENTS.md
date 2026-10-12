@@ -49,9 +49,11 @@
 - **A message in `pending/` must always have a dispatcher coming for it.**
   This is what makes the queue recoverable: `add` spawns a dispatcher, so any
   death still leaves the message deliverable. `add --priority`/`--interrupt` deliberately
-  do NOT spawn one up front, because it would race the immediate send for the
-  same file — so it carries the obligation itself, via a `finally` that
-  spawns a dispatcher whenever the message is still in `pending/` as the
+  reserve the message in `tmp/priority.<message-filename>` BEFORE publishing
+  it in `pending/`; dispatchers defer files reserved by a live creator PID.
+  Not spawning a new dispatcher is insufficient: one can already be in
+  LINGER. The urgent path carries the recovery obligation itself, via a
+  `finally` that spawns a dispatcher whenever the message is still in `pending/` as the
   function unwinds, plus SIGINT/SIGTERM handlers so a process-group teardown
   reaches that `finally`. Removing either half reintroduces a real defect: a
   killed priority send once stranded a message for 14 hours, its log frozen at

@@ -68,7 +68,10 @@ Subcommands:
       message at the agent's next convenience; Paseo has no primitive
       between send and stop. The send uses --no-wait, so this returns once
       the daemon accepts the prompt rather than blocking until the agent has
-      processed it.
+      processed it. The caller reserves this message before publishing it
+      in pending/, so a live dispatcher defers it. It never waits for the
+      dispatcher lock; a different in-flight send gets at most
+      PASEO_QUEUE_PRIORITY_GRACE seconds before delivery proceeds anyway.
       --interrupt: CANCEL THE AGENT'S CURRENT TURN, then deliver. Runs
       `paseo stop` first, so whatever the agent was part-way through is
       LOST, including work it had not yet reported. Implies --priority.
@@ -830,72 +833,86 @@ def read_state(agent_dir):
         return ""
 
 
-def deliver_priority(agent_dir, uuid, filename, quiet, short_id,
+def priority_reservation(agent_dir, filename):
+    return os.path.join(agent_dir, "tmp", "priority." + filename)
+
+
+def priority_owner_alive(agent_dir, filename):
+    """A reservation is installed BEFORE the message becomes dispatcher-visible.
+
+    The payload never leaves pending/ until sent. Dead owners need no special
+    recovery format: ignore their reservation and deliver the ordinary .msg.
+    """
+    reservation = priority_reservation(agent_dir, filename)
+    if not os.path.exists(reservation):
+        return False
+    try:
+        pid = int(filename.split("-")[1])
+        if pid <= 0:
+            return False
+    except (ValueError, IndexError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        return True  # Permission/inspection errors are not proof of death.
+    else:
+        try:
+            command = subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", "command="],
+                stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.CalledProcessError):
+            return True  # Retry next scan rather than risk a second sender.
+        if b"paseo-queue" in command:
+            return True
+    try:
+        os.unlink(reservation)
+    except OSError:
+        pass
+    return False
+
+
+def deliver_priority(agent_dir, uuid, filename, quiet, short_id, stage_path,
                      preempt=False):
-    """Deliver one message NOW, bypassing the idle/permission gate.
+    """Reserve before publication, then send without taking the dispatcher lock.
 
-    This exists to remove a duplicate-delivery trap. The documented way to
-    interrupt an agent used to be a bare `paseo send`, which the queue knows
-    nothing about: if the message had also been queued, the dispatcher
-    delivered it a SECOND time later. Routing the interrupt through the queue
-    means the message is recorded, delivered once, and moved to sent/, so no
-    dispatcher will ever pick it up again.
-
-    What is bypassed, deliberately: the `paseo inspect` status check, the
-    `paseo wait` loop that holds until the agent is idle, and the
-    pending-permission hold. That IS the interrupt. FIFO is also bypassed --
-    this message jumps any backlog, which is why the receipt says
-    "interrupted" rather than "delivered".
+    A dispatcher can neither select this message before publication nor send
+    it while the reservation's owner is alive. Different messages can still
+    be sent concurrently after the bounded grace period.
     """
     path = os.path.join(agent_dir, "pending", filename)
-
-    # Narrow the one real correctness hazard: a live dispatcher already inside
-    # a `paseo send` for this agent. Sending concurrently would put two
-    # prompts into one agent at once. The per-agent lock is the wrong gate
-    # here, because a dispatcher holds it for its whole lifetime including
-    # linger, so waiting on it would make an "interrupt" wait ten seconds for
-    # an idle dispatcher. The state file marks the actual send window, so wait
-    # only for that, briefly, and proceed regardless -- an interrupt that
-    # silently becomes a queued message is worse than a warned-about race.
-    grace = env_int("PASEO_QUEUE_PRIORITY_GRACE", 10)
-    waited = 0
-    while read_state(agent_dir) == "sending" and waited < grace:
-        time.sleep(1)
-        waited += 1
-    raced = read_state(agent_dir) == "sending"
-    if raced:
-        log_line(agent_dir, "PRIORITY-RACE",
-                 "msg=%s dispatcher still sending after %ss" % (filename, grace))
-        sys.stderr.write("paseo-queue: add --interrupt: a dispatcher is still "
-                         "sending for %s; delivering anyway (possible "
-                         "concurrent prompt)\n" % short_id)
-
-    log_line(agent_dir, "PRIORITY-BEGIN", filename)
+    reservation = priority_reservation(agent_dir, filename)
     stderr_path = os.path.join(agent_dir, "tmp", "priority.%d" % os.getpid())
 
-    # CRASH SAFETY. The normal enqueue path is recoverable by construction:
-    # `add` spawns a dispatcher, so if anything dies the dispatcher still
-    # delivers. The interrupt path deliberately does NOT spawn one up front
-    # (it would race this process for the same file), which means a death
-    # between INTERRUPT-BEGIN and the move into sent/ used to strand the
-    # message in pending/ with nothing left to recover it. That was observed
-    # in the wild: a queue sat at "ENQ then INTERRUPT-BEGIN then silence" for
-    # 14 hours.
-    #
-    # So: catch the signals that a process-group teardown or a Ctrl-C would
-    # deliver, and guarantee via `finally` that if the message is still in
-    # pending/ when this function unwinds for ANY reason, a dispatcher is
-    # spawned to pick it up. A SIGKILL still cannot be caught -- nothing in
-    # process can help there -- but such a message stays in pending/ and is
-    # recovered by the next `add`, `drain` or dispatcher spawn for that agent.
     def _interrupt_bail(signum, unused_frame):
-        raise KeyboardInterrupt("signal %s during interrupt send" % signum)
+        raise KeyboardInterrupt("signal %s during priority send" % signum)
 
     prev_int = signal.getsignal(signal.SIGINT)
     prev_term = signal.getsignal(signal.SIGTERM)
     signal.signal(signal.SIGINT, _interrupt_bail)
     signal.signal(signal.SIGTERM, _interrupt_bail)
     try:
+        # Install ownership before publishing: no enqueue-to-claim race, and
+        # no rename away from pending/ that could hide a SIGKILLed message.
+        with open(reservation, "w"):
+            pass
+        publish_message(agent_dir, uuid, filename, stage_path, quiet, True)
+
+        grace = env_int("PASEO_QUEUE_PRIORITY_GRACE", 10)
+        waited = 0
+        while read_state(agent_dir) == "sending" and waited < grace:
+            time.sleep(1)
+            waited += 1
+        if read_state(agent_dir) == "sending":
+            log_line(agent_dir, "PRIORITY-RACE",
+                     "msg=%s dispatcher still sending after %ss" % (filename, grace))
+            sys.stderr.write("paseo-queue: add --priority: a dispatcher is still "
+                             "sending for %s; delivering anyway (different "
+                             "concurrent prompt)\n" % short_id)
+
+        log_line(agent_dir, "PRIORITY-BEGIN", filename)
         return _deliver_priority_send(agent_dir, uuid, filename, quiet,
                                       short_id, path, stderr_path, preempt)
     except (KeyboardInterrupt, SystemExit):
@@ -903,20 +920,20 @@ def deliver_priority(agent_dir, uuid, filename, quiet, short_id,
                  "msg=%s aborted mid-delivery; leaving it queued" % filename)
         raise
     finally:
-        signal.signal(signal.SIGINT, prev_int)
-        signal.signal(signal.SIGTERM, prev_term)
-        # Do not leave the scratch stderr file behind. An aborted interrupt
-        # used to leak tmp/interrupt.<pid>, and since `rm --all` only
-        # garbage-collects an orphaned queue when pending/sent/failed/tmp are
-        # ALL empty, that stub kept a dead agent's directory alive forever.
+        # Release ownership only after filing sent/ or abandoning the send.
+        # SIGKILL leaves the payload in pending/; the next dispatcher ignores
+        # the dead owner's reservation. Catchable signals also spawn recovery.
         try:
-            os.unlink(stderr_path)
-        except OSError:
-            pass
-        # The single guarantee: a message still in pending/ always has a
-        # dispatcher coming for it.
-        if os.path.exists(path):
-            spawn_dispatcher(uuid)
+            for scratch in (reservation, stderr_path):
+                try:
+                    os.unlink(scratch)
+                except OSError:
+                    pass
+            if os.path.exists(path):
+                spawn_dispatcher(uuid)
+        finally:
+            signal.signal(signal.SIGINT, prev_int)
+            signal.signal(signal.SIGTERM, prev_term)
 
 
 def _deliver_priority_send(agent_dir, uuid, filename, quiet, short_id, path,
@@ -926,8 +943,8 @@ def _deliver_priority_send(agent_dir, uuid, filename, quiet, short_id, path,
     With preempt=True (`add --interrupt`) the agent's current turn is
     CANCELLED before the send. That is destructive: whatever it was part-way
     through is lost, including work it had not yet reported. It is the whole
-    difference from --priority, which arrives mid-turn and lets the agent
-    carry on.
+    difference from --priority, which preserves the turn and context but
+    cancels an in-flight tool call.
     """
     if preempt:
         # `paseo stop` exits 0 even for an agent that does not exist, so its
@@ -1086,14 +1103,10 @@ def cmd_add(args):
 
     try:
         filename = next_msg_name(agent_dir)
-        os.replace(stage_path, os.path.join(agent_dir, "pending", filename))
-        log_line(agent_dir, "ENQ", "%s %s" % (uuid, filename))
-        # An interrupt delivers this message itself, so it must NOT also spawn
-        # a dispatcher here: that dispatcher would race it for the same file.
-        # If the interrupt send fails, deliver_interrupt spawns one so the
-        # message degrades to an ordinary queued message rather than sitting.
-        if not priority:
-            spawn_dispatcher(uuid)
+        if priority:
+            return deliver_priority(agent_dir, uuid, filename, quiet, uuid[:7],
+                                    stage_path, preempt)
+        publish_message(agent_dir, uuid, filename, stage_path, quiet, False)
     except (IOError, OSError, RuntimeError) as exc:
         try:
             os.unlink(stage_path)
@@ -1101,6 +1114,18 @@ def cmd_add(args):
             pass
         return die("add: failed to enqueue message: %s" % exc)
 
+    if wait:
+        return wait_for_delivery(agent_dir, filename,
+                                 int(timeout) if timeout is not None else None,
+                                 quiet, uuid[:7])
+    return 0
+
+
+def publish_message(agent_dir, uuid, filename, stage_path, quiet, priority):
+    os.replace(stage_path, os.path.join(agent_dir, "pending", filename))
+    log_line(agent_dir, "ENQ", "%s %s" % (uuid, filename))
+    if not priority:
+        spawn_dispatcher(uuid)
     short_id = uuid[:7]
     # Name the target's state in the receipt. `enqueued` is a statement about
     # the SENDER's side only -- the message is on disk and correctly addressed
@@ -1135,14 +1160,6 @@ def cmd_add(args):
             "paseo-queue: WARN: %s is %s; this message stays queued until the "
             "agent runs again. The dispatcher will halt with state "
             "halted-closed rather than deliver it.\n" % (short_id, target_state))
-    if priority:
-        return deliver_priority(agent_dir, uuid, filename, quiet, short_id,
-                                preempt)
-    if wait:
-        return wait_for_delivery(agent_dir, filename,
-                                 int(timeout) if timeout is not None else None,
-                                 quiet, short_id)
-    return 0
 
 
 def cmd_rm(args):
@@ -1290,6 +1307,11 @@ def cmd_dispatch(args):
 
         path = pending[0]
         filename = os.path.basename(path)
+        if priority_owner_alive(agent_dir, filename):
+            # The urgent caller owns this file, even during LINGER or grace.
+            # Do not wait on the agent or send it from this process.
+            time.sleep(1)
+            continue
         if filename != send_fail_msg:
             send_fail_count = 0
             send_fail_msg = filename
