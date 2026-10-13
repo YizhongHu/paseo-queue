@@ -89,10 +89,14 @@
   sandbox per test (its own `PASEO_QUEUE_HOME`, its own mock `paseo` shim
   placed first on `PATH`, and fast dispatcher knobs), so tests never touch
   a real `~/.paseo-queue` or a real Paseo daemon and can run in any order.
-- **This tool is disposable.** It exists only until
-  [getpaseo/paseo#3797](https://github.com/getpaseo/paseo/pull/3797) ships
-  upstream. Do not over-engineer; prefer the simplest correct
-  implementation of the design plan.
+- **This tool is disposable.** It is a deliberately scoped stopgap for an
+  unresolved upstream gap: the proposed queue PR
+  [getpaseo/paseo#3797](https://github.com/getpaseo/paseo/pull/3797) was closed
+  without merging, alongside the earlier pull request
+  [getpaseo/paseo#1826](https://github.com/getpaseo/paseo/pull/1826); see also
+  [getpaseo/paseo#4871](https://github.com/getpaseo/paseo/issues/4871). Do not
+  over-engineer; prefer the simplest correct implementation of the design
+  plan until an actual upstream replacement exists.
 - **Never put backticks in git commit messages.** Backticks trigger shell
   command substitution and can silently corrupt or truncate the message.
   For multi-line commit messages, use `git commit -F -` with a quoted

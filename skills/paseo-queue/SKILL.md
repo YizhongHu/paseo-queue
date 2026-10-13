@@ -140,8 +140,14 @@ candidate on stderr — name matching is exact, never a prefix.
 
 ## Limits
 
-Messages are capped at 256 KiB by default (`PASEO_QUEUE_MAX_BYTES`). This
-is a local stopgap — delete it once getpaseo/paseo#3797 ships upstream.
+Messages are capped at 256 KiB by default (`PASEO_QUEUE_MAX_BYTES`). Keep this
+local safety limit: the proposed daemon-owned queue in
+[getpaseo/paseo#3797](https://github.com/getpaseo/paseo/pull/3797) was closed
+without merging, as was the pull request
+[getpaseo/paseo#1826](https://github.com/getpaseo/paseo/pull/1826), and
+[getpaseo/paseo#4871](https://github.com/getpaseo/paseo/issues/4871) records
+the unresolved gap. Remove the cap only after an actual upstream replacement
+is shipped and verified; no such replacement exists now.
 
 FIFO is per-agent and holds for queued messages, but `--priority` and
 `--interrupt` deliberately jump the backlog: they are delivered before

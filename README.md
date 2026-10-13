@@ -410,10 +410,15 @@ flags the two conditions below with a stderr `WARN` line.
 
 ## Disposability
 
-`paseo-queue` is an explicit stopgap, not a permanent tool. It exists only
-until the daemon-owned queue feature upstream
-([getpaseo/paseo#3797](https://github.com/getpaseo/paseo/pull/3797)) merges
-and ships in a release. Once that happens, uninstall by:
+`paseo-queue` is an explicit stopgap, not a permanent tool, for an upstream
+gap that remains unresolved. The proposed daemon-owned queue in
+[getpaseo/paseo#3797](https://github.com/getpaseo/paseo/pull/3797) was closed
+without merging, as was the pull request
+[getpaseo/paseo#1826](https://github.com/getpaseo/paseo/pull/1826);
+[getpaseo/paseo#4871](https://github.com/getpaseo/paseo/issues/4871) records
+the same daemon-owned queue gap. The in-app queue is client-owned and is not a
+replacement for this tool. Keep using `paseo-queue` until an actual upstream
+replacement is shipped and verified. If that day comes, uninstall by:
 
 1. Removing the `~/.local/bin/paseo-queue` symlink.
 2. Removing the installed skill directories: `~/.claude/skills/paseo-queue/`,
