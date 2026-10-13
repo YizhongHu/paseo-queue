@@ -165,6 +165,24 @@ paseo-queue <subcommand> [args]
   message that was also queued then arrives twice. A failed immediate send
   leaves the message queued for normal delivery and exits nonzero.
 
+  Before publishing an urgent message in `pending/`, its caller reserves it
+  with `tmp/priority.<message-filename>`. A live dispatcher defers that file
+  while its creator PID is alive. The urgent caller never waits for or steals
+  the dispatcher lock: if another message is mid-send, it waits at most
+  `PASEO_QUEUE_PRIORITY_GRACE` seconds (default 10), warns, then sends anyway.
+  A lingering dispatcher causes no extra delay. Ownership is established
+  before publication, so there is no contested rename after either sender
+  has already opened the payload.
+
+  The payload stays in `pending/` until successfully filed in `sent/`. Failure
+  or SIGINT/SIGTERM releases the reservation and spawns recovery in `finally`;
+  handlers cover publication and the grace period too. After SIGKILL, the
+  next dispatcher ignores the dead owner's reservation and delivers the
+  normal pending file. The directory layout and message filenames are unchanged.
+  Both caller and dispatcher must run the fixed version: an old dispatcher
+  already in memory does not understand reservations. Let old dispatchers
+  exit before using urgent sends after an upgrade or rollback.
+
   One semantic difference worth knowing: for a queued message, `sent/` means
   the receiving agent *processed* it, because the dispatcher waits for that.
   For `--priority`/`--interrupt` it means the daemon *accepted* it — delivery
@@ -346,7 +364,7 @@ value below unless overridden.
 | `PASEO_QUEUE_WAIT_TIMEOUT`       | `60`                 | Timeout passed to the dispatcher's internal `paseo wait` call. |
 | `PASEO_QUEUE_MAX_BYTES`          | `262144`             | Max enqueued message size in bytes. |
 | `PASEO_QUEUE_WAIT_PROGRESS_EVERY`| `15`                 | Seconds between `add --wait` progress lines on stderr; `0` disables them. |
-| `PASEO_QUEUE_PRIORITY_GRACE`     | `10`                 | Seconds `add --interrupt` waits for an in-flight dispatcher send before proceeding anyway. |
+| `PASEO_QUEUE_PRIORITY_GRACE`     | `10`                 | Seconds `add --priority`/`--interrupt` waits for a different in-flight dispatcher send before proceeding anyway. |
 | `PASEO_QUEUE_LS_RETRY_DELAY`     | `0.5`                | Seconds to wait before retrying a failed `paseo ls --json` snapshot fetch. |
 | `PASEO_QUEUE_SEND_RETRIES`       | `5`                  | Transient send-failure retry count before a message is moved to `failed/`. |
 | `PASEO_QUEUE_DAEMON_RETRIES`     | `15`                 | Transient daemon-unreachable retry count before the dispatcher halts as `stalled-daemon`. |
@@ -391,9 +409,14 @@ flags the two conditions below with a stderr `WARN` line.
   deliberately conservative). If a dispatcher
   dies uncleanly and the OS later reuses that exact pid for an unrelated
   `paseo-queue` process before the stale lock is broken, the lock can
-  appear live for longer than it should. The only consequence is a delayed
-  dispatch resumption — messages are never double-sent, because delivery
-  itself is always guarded by the same lock.
+  appear live for longer than it should, delaying dispatch resumption.
+  Dispatcher-to-dispatcher exclusion still uses that lock; urgent callers
+  use the per-message reservation described above.
+- **A lost acceptance acknowledgement is still ambiguous.** If the daemon
+  accepts a send and the caller dies before recording `sent/`, recovery may
+  resend it. Reservations prevent two live paths from sending the same file;
+  they cannot provide transactional delivery across the daemon and filesystem.
+  Priority-owner liveness has the same narrow PID-reuse delay risk as locks.
 - **A backwards system clock jump can reorder pending messages.** Filenames
   embed the epoch second, and delivery pops the lexicographically-first
   filename, so a clock that jumps backwards between two enqueues can make
