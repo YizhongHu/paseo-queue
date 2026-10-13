@@ -41,8 +41,19 @@
   intermittently and those failures are hard to reproduce; the tool used to
   route that stderr to DEVNULL, destroying the evidence on every occurrence.
   Failures go to `$PASEO_QUEUE_HOME/daemon.log` with exit code, duration,
-  byte count, load average and stderr. Diagnostics are best effort and must
-  never be able to fail a command.
+  byte count, load average and stderr. Keeping only the last line defeats
+  this invariant: pretty-printed JSON may end in just `}`. Preserve stderr
+  from the beginning up to a sane byte cap, escape newlines to keep each
+  record on one line, and mark truncation. Diagnostics are best effort and
+  must never be able to fail a command.
+- **Never relay upstream remediation text to an agent.** Upstream stderr
+  and JSON `details` can recommend starting a daemon against a live home.
+  Keep that evidence in diagnostic logs; print only queue-owned guidance.
+  A failed snapshot with EPERM / operation not permitted / not permitted
+  is a local sandbox/permission failure: tell the caller to retry with
+  escalated permissions or request full-access, not to repair the daemon.
+  Exit 3 still means the snapshot could not be obtained; do not classify
+  permission failures from the return code alone.
 - **A malformed daemon response is a daemon fault, not an empty fleet.**
   Parsing failure must surface as exit 3, never as a silently empty agent
   list — that is how a truncated read masqueraded as `no agent matches`.
