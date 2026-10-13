@@ -8,6 +8,7 @@ from __future__ import print_function
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -103,7 +104,7 @@ Subcommands:
       absent from the current `paseo ls` snapshot are marked ORPHANED.
       Emits stderr WARN lines when an agent has pending messages but no
       live dispatcher, or when its state is holding-permission. Exits 3 if
-      `paseo ls --json` itself fails (daemon unreachable).
+      `paseo ls --json` itself fails (daemon or local permission problem).
 
   drain <agent> [--quiet]
       Force-(re)start the dispatcher for <agent> (ensures its state
@@ -137,6 +138,12 @@ directory even when the agent no longer appears in `paseo ls` (the "orphan"
 escape hatch) -- this never applies to add/drain, which require a live
 agent.
 
+Snapshot permission failures (EPERM / operation not permitted / not permitted)
+mean the local process is blocked by sandbox/permissions, not a daemon fault:
+retry with escalated permissions or request full-access. Exit remains 3.
+Upstream remediation is never printed; raw stderr is kept in daemon.log
+(first 4096 bytes, escaped onto one line, with truncation marked).
+
 Environment knobs (all test-overridable):
   PASEO_QUEUE_HOME              State root (default: $HOME/.paseo-queue)
   PASEO_QUEUE_LINGER            Dispatcher idle linger, seconds (default: 10)
@@ -157,7 +164,7 @@ Exit codes:
   0  ok
   1  error (validation failure, missing dispatcher, no message, etc.)
   2  agent resolution failure (not found or ambiguous)
-  3  daemon unreachable (`paseo ls`/`paseo inspect` failed)
+  3  daemon query failed (includes local sandbox/permission failures)
   4  add --wait-timeout elapsed (message remains queued)
 """
 
@@ -169,6 +176,7 @@ EXIT_TIMEOUT = 4
 LS_JSON_FETCHED = False
 LS_JSON_OUT = b""
 LS_JSON_RC = 0
+LS_JSON_PERMISSION_DENIED = False
 LS_JSON_ROWS = []
 LAST_RESOLVE_RC = EXIT_RESOLUTION
 LAST_RESOLVE_STATUS = ""
@@ -243,12 +251,33 @@ def _run_ls_json():
     return rc, out, err, int((time.time() - started) * 1000)
 
 
-def _err_tail(err):
+def _err_record(err):
+    """Keep the beginning, not just a JSON closing brace; bound input bytes."""
     try:
-        lines = [l for l in err.decode("utf-8", "replace").strip().splitlines() if l.strip()]
+        text = err[:4096].decode("utf-8", "replace")
+        # JSON escaping also protects against CR, control bytes and literal
+        # backslashes. Omit outer quotes to preserve the stderr= field format.
+        record = json.dumps(text, ensure_ascii=True)[1:-1]
+        return record + (" [truncated]" if len(err) > 4096 else "")
     except Exception:
         return ""
-    return lines[-1][:300] if lines else ""
+
+
+def _permission_denied(err):
+    # Only the observed permission signatures; never infer this from rc.
+    return re.search(rb"\b(?:EPERM|operation not permitted|not permitted)\b",
+                     err, re.IGNORECASE) is not None
+
+
+def snapshot_failure_message():
+    # Never relay upstream stderr/details to agents: its remediation can
+    # direct them to start a daemon against a live home after escalation.
+    # Keep that raw evidence in daemon.log; only print our own guidance.
+    if LS_JSON_PERMISSION_DENIED:
+        return ("paseo ls --json blocked by local sandbox/permissions "
+                "(not a daemon fault); retry with escalated permissions or "
+                "request full-access")
+    return "paseo ls --json failed (daemon unreachable or invalid response)"
 
 
 def fetch_ls_json():
@@ -261,12 +290,16 @@ def fetch_ls_json():
     daemon's own stderr, the load average, and whether the retry recovered.
     """
     global LS_JSON_FETCHED, LS_JSON_OUT, LS_JSON_RC, LS_JSON_ROWS
+    global LS_JSON_PERMISSION_DENIED
     if LS_JSON_FETCHED:
         return LS_JSON_RC
 
     attempts = []
     for attempt in (1, 2):
         rc, out, err, ms = _run_ls_json()
+        # Use the final attempt's outcome, including a successful retry.
+        # Inspect captured bytes before the diagnostic cap is applied.
+        LS_JSON_PERMISSION_DENIED = rc != 0 and _permission_denied(err)
         parsed = None
         parse_error = ""
         if rc == 0:
@@ -277,7 +310,7 @@ def fetch_ls_json():
                 # fleet. Treating it as empty is how a truncated read used to
                 # surface as "no agent matches", hiding the real fault.
                 parse_error = str(exc)[:200]
-        attempts.append((rc, ms, _err_tail(err), len(out), parse_error))
+        attempts.append((rc, ms, _err_record(err), len(out), parse_error))
         if rc == 0 and not parse_error:
             LS_JSON_OUT, LS_JSON_RC = out, 0
             if attempt == 2:
@@ -288,7 +321,7 @@ def fetch_ls_json():
         daemon_log("LS-FAIL",
                    "attempt=%s rc=%s ms=%s bytes=%s load=%s parse_error=%s stderr=%s"
                    % (attempt, rc, ms, len(out), load_average(),
-                      parse_error or "-", _err_tail(err) or "-"))
+                      parse_error or "-", _err_record(err) or "-"))
         if attempt == 1:
             time.sleep(float(os.environ.get("PASEO_QUEUE_LS_RETRY_DELAY", "0.5")))
         else:
@@ -327,7 +360,7 @@ def resolve_agent(query, allow_orphan=True):
     LAST_RESOLVE_STATUS = ""
     if fetch_ls_json() != 0:
         LAST_RESOLVE_RC = EXIT_DAEMON
-        sys.stderr.write("paseo-queue: paseo ls --json failed (daemon unreachable?)\n")
+        sys.stderr.write("paseo-queue: %s\n" % snapshot_failure_message())
         return None
 
     candidates = []
@@ -1023,9 +1056,11 @@ def _deliver_priority_send(agent_dir, uuid, filename, quiet, short_id, path,
         tail = ""
     log_line(agent_dir, "PRIORITY-FAIL",
              "msg=%s rc=%s %s" % (filename, send_rc, tail))
+    # Never relay upstream remediation to an agent, even on send failures.
+    # The upstream text stays in dispatch.log, not in the caller's message.
     return die("add --priority: immediate send failed (rc=%s); message stays "
-               "queued for normal delivery%s"
-               % (send_rc, (": " + tail) if tail else ""))
+               "queued for normal delivery; see dispatch.log for diagnostics"
+               % send_rc)
 
 
 def spawn_dispatcher(uuid):
@@ -1477,8 +1512,7 @@ def dispatcher_alive(agent_dir):
 
 def cmd_status(args):
     if fetch_ls_json() != 0:
-        sys.stderr.write(
-            "paseo-queue: status: paseo ls --json failed (daemon unreachable?)\n")
+        sys.stderr.write("paseo-queue: status: %s\n" % snapshot_failure_message())
         return EXIT_DAEMON
     home = queue_home()
     if not os.path.isdir(home):

@@ -206,7 +206,7 @@ paseo-queue <subcommand> [args]
   from the current `paseo ls` snapshot are marked ORPHANED. Emits stderr
   WARN lines when an agent has pending messages but no live dispatcher, or
   when its state is `holding-permission`. Exits 3 if `paseo ls --json`
-  itself fails (daemon unreachable).
+  itself fails (daemon or local permission problem).
 
 - **`drain <agent> [--quiet]`**
   Force-(re)start the dispatcher for `<agent>` (ensures its state
@@ -324,7 +324,12 @@ to `$PASEO_QUEUE_HOME/daemon.log`:
 
 Each record carries the exit code, how long the call took, how many bytes
 came back, the **load average** (load is the suspected trigger), any JSON
-parse error, and the daemon's own stderr. `LS-RECOVERED` means the retry
+parse error, and the daemon's own stderr. The `stderr=` and `prev_err=`
+fields retain the first **4096 input bytes**, with JSON string escaping
+(without enclosing quotes) so newlines appear as `\n` and each record stays
+on one line. Longer input has a ` [truncated]` suffix. Keeping only the last
+line loses the cause when pretty-printed JSON ends in `}`.
+`LS-RECOVERED` means the retry
 worked and the command proceeded — useful for telling a transient blip from
 a real outage after the fact. The log rotates at 1 MiB to `daemon.log.1`.
 
@@ -334,6 +339,24 @@ stderr discarded, so the single most diagnostic artefact was thrown away
 every time. A malformed response was also treated as an empty fleet, so a
 daemon fault surfaced as `no agent matches` rather than as a daemon fault;
 it is now correctly reported as exit 3.
+
+If a nonzero snapshot result contains **EPERM**, **operation not permitted**,
+or **not permitted** (case-insensitive, word-bounded), the caller gets a
+local sandbox/permission diagnosis: **retry with escalated permissions or
+request full-access**. For example, the macOS workspace-write sandbox can
+deny the uptime sysctl used by Paseo's CLI (`uv_uptime`), even while the
+daemon is healthy. This error is not evidence that the daemon needs repair.
+Classification uses the captured stderr before truncation and the final
+attempt's outcome; a successful retry proceeds normally. A failed result
+without those signatures still reports a daemon query failure.
+
+Exit **3** is retained for all snapshot failures, preserving the existing
+caller contract; use the diagnostic message to distinguish permission
+denial from a connection/response problem. Queue errors print only our own
+guidance, never upstream stderr or its remediation `details`. Raw upstream
+text remains in diagnostic logs for human inspection. Immediate-send
+failures likewise keep upstream advice out of the caller's message and
+point to `dispatch.log`.
 
 ## State layout
 
@@ -379,7 +402,7 @@ value below unless overridden.
 | `0`  | Ok. |
 | `1`  | Error (validation failure, missing dispatcher, no message, a `--wait`ed message reaching `failed/`/`halted-*`, a failed `--interrupt` whose message stays queued, etc.). |
 | `2`  | Agent resolution failure (not found or ambiguous). |
-| `3`  | Daemon unreachable (`paseo ls`/`paseo inspect` failed). |
+| `3`  | Daemon query failed, including local sandbox/permission failures. |
 | `4`  | `add --wait-timeout` elapsed (message remains queued). |
 
 ## Recovery runbook

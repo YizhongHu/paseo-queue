@@ -1,0 +1,4 @@
+[1012/174225.305420:ERROR:electron/shell/common/mac/codesign_util.cc:79] task_name_for_pid: (os/kern) failure (5)
+{ "error": { "code": "ERR_SYSTEM_ERROR",
+  "message": "Cannot connect to daemon at home /Users/yizhonghu/.paseo: A system error occurred: uv_uptime returned EPERM (operation not permitted)",
+  "details": "Start with: paseo daemon start --home \"/Users/yizhonghu/.paseo\"" } }
